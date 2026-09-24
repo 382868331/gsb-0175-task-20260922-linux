@@ -1,8 +1,14 @@
 # wayplan — 可分配缓存路数的性能隔离规划
 
-离线体系结构优化工具库：对最多 6 个应用的合成访存块序列，逐路模拟
-set-associative LRU miss 曲线，再用**精确动态规划**在路数预算内选择每应用的
-隔离路数，最小化带正整数权重的 miss 总和，并在隔离缓存上重放统计。
+离线体系结构优化工具库，包含两个相互独立的精确规划能力：
+
+1. **缓存路数分配**：对最多 6 个应用的合成访存块序列，逐路模拟
+   set-associative LRU miss 曲线，再用**精确动态规划**在路数预算内选择每
+   应用的隔离路数，最小化带正整数权重的 miss 总和，并在隔离缓存上重放统计。
+2. **已知阶段序列的分阶段规划**：给最多 3 个任务各输入一条已知阶段序列
+   （最多 4 阶段）和每阶段的离散性能（损失）曲线（最多 8 个路数点），
+   阶段间改路数按变化量收取线性迁移成本，并可限制单次最大变化量；用
+   **精确动态规划**满足每阶段最小路数约束、最小化累计损失加迁移成本。
 
 - **Python 版本**：3.14.7（仅使用标准库，语法兼容 3.10+）
 - **依赖**：无第三方依赖，无需网络、账号、数据库、Docker；安装 Python 即可运行
@@ -12,7 +18,7 @@ set-associative LRU miss 曲线，再用**精确动态规划**在路数预算内
 
 ```bash
 python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 确定性演示（约 0.1 秒，远低于 8 秒上限）
+python demo.py                            # 确定性演示（约 0.1 秒，远低于 90 秒上限）
 ```
 
 ```python
@@ -26,6 +32,16 @@ print(result.allocation_map()) # {'appA': 2, 'appB': 1}
 stats = replay_isolated(traces, result.allocation_map(), num_sets=1)
 ```
 
+```python
+from wayplan import TaskSpec, plan_stages
+
+# 每个任务给出按阶段排列的离散损失曲线；下标 [s][w-1] = 阶段 s 用 w 路的损失
+tasks = [TaskSpec("t0", [(0, 100), (100, 0)])]
+plan = plan_stages(tasks, migration_cost=6)
+print(plan.ways_map())          # {'t0': (1, 2)}
+print(plan.total_cost)          # 6 = 损失 0 + 迁移 6
+```
+
 ## 接口（固定契约）
 
 | 名称 | 说明 |
@@ -35,12 +51,45 @@ stats = replay_isolated(traces, result.allocation_map(), num_sets=1)
 | `miss_curve(blocks, num_sets, max_ways) -> tuple[int, ...]` | 下标 `w-1` 为 `w` 路的 miss 数 |
 | `plan_allocation(traces, weights, num_sets, total_ways, budget) -> PlanResult` | 精确 DP 最优分配 |
 | `replay_isolated(traces, allocation, num_sets) -> tuple[ReplayStats, ...]` | 隔离缓存重放统计 |
+| `TaskSpec(task_id, losses, min_ways=1)` | 一个任务的已知阶段序列与离散损失曲线（已验证、不可变） |
+| `plan_stages(tasks, migration_cost=1, switch_cost=0, max_change=None) -> StagePlanResult` | 已知阶段序列的精确 DP 规划 |
 | `WayPlanError` / `ValidationError` / `InfeasibleBudgetError` | 错误分类 |
-| `MAX_APPS` / `MAX_SETS` / `MAX_WAYS` | 接口上限常量 6 / 16 / 12 |
+| `MAX_APPS` / `MAX_SETS` / `MAX_WAYS` | 分配模型上限常量 6 / 16 / 12 |
+| `MAX_TASKS` / `MAX_STAGES` / `MAX_DYN_WAYS` | 阶段模型上限常量 3 / 4 / 8 |
 
 `PlanResult` 字段：`num_sets, total_ways, budget, app_ids（按 app id 排序）,
 weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 另有 `allocation_map()` 返回 `{app_id: ways}`。
+
+### 分阶段规划模型（`plan_stages`）
+
+- 每个任务用 `TaskSpec` 描述：`losses` 是按已知顺序排列的阶段曲线，
+  `losses[s][w-1]` 为阶段 `s` 选择 `w` 路时的离散性能值（非负整数“损失”，
+  越小越好，**不假定单调或凸**）；所有任务的阶段数一致（1..4），所有曲线
+  覆盖同一组路数 1..`max_ways`（最多 8 个点）。
+- 每阶段每任务的路数必须满足最小路数约束：`min_ways` 可为单个正整数
+  （对所有阶段生效）或长度等于阶段数的序列（逐阶段约束），缺省为 1。
+- 相邻阶段之间，任务路数由 `p` 改为 `w` 的迁移成本为
+  `migration_cost * |w - p|`（按变化量线性收取，缺省 1）；若发生实际变化
+  （`|w-p| > 0`），再收取一次固定 `switch_cost`（缺省 0）。两者都设 0
+  即退化为各阶段独立最优。
+- `max_change` 限制相邻阶段路数差 `|w - p|`（正整数，缺省 `None` 不限制）。
+- 目标：最小化所有任务所有阶段的损失之和加全部迁移成本，均为精确整数。
+  并列时返回按“阶段在外、任务（按 task id 排序）在内”展平的字典序最小
+  方案。
+- 合法实例必然可行（每阶段总能选到不小于自身最小路数的路数），因此该
+  入口不会抛 `InfeasibleBudgetError`；只有输入不合法时抛 `ValidationError`。
+
+`StagePlanResult` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `task_ids` | 按 task id 排序的任务元组 |
+| `num_stages` / `migration_cost` / `switch_cost` / `max_change` | 生效参数（不限制时 `max_change == MAX_DYN_WAYS`） |
+| `ways` | `ways[i][s]` 为任务 i 在阶段 s 的路数；另附 `ways_map()` 与逐阶段的 `stage_ways_map()` |
+| `stage_losses` | 每阶段所有任务的损失和 |
+| `transition_costs` | 进入阶段 s 时付出的迁移成本（阶段 0 恒为 0） |
+| `total_loss` / `total_transition_cost` / `total_cost` | 累计损失 / 累计迁移 / 最小化目标值（恒等于前两者之和） |
 
 ### 地址模型
 
@@ -56,6 +105,10 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 - 块地址为非负 int，轨迹非空；
 - 权重为正整数，按 `traces` 的**输入顺序**对齐（库内部再按 app id 排序，
   权重随应用走，不会错位）。
+- 阶段模型：任务 1..3、阶段 1..4、每曲线 1..8 个路数点；`task_id` 为
+  非空字符串且唯一；损失为非负 int；`migration_cost` / `switch_cost` 为
+  非负 int；`min_ways` 为 1..8 且不超过曲线点数；`max_change` 为 1..8 或
+  `None`。
 
 ## 错误语义
 
@@ -66,11 +119,15 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 - `InfeasibleBudgetError`：输入合法，但 `budget < 应用数`，**可证明无解**
   （每应用至少一路）。规划器是精确、完备的动态规划，不存在“搜索预算耗尽”
   这一结果，因此两种情形在类型上天然分开，绝不混淆。
-- 库不持有任何模块级可变状态：调用失败不会留下部分变更，后续调用不受影响。
+- **分阶段规划同样“先验证后计算”**：所有任务曲线、阶段数一致性、
+  最小路数、成本与变化量参数在进入 DP 前集中校验，失败即抛，无任何
+  模块级可变状态，失败调用不会影响后续调用。
 
 ## 精度口径（浮点结果）
 
 - miss 数、分配路数、加权目标值均为**精确整数**，无误差。
+- 分阶段规划的损失、路数、迁移成本与目标值同样全部为**精确整数**
+  （线性成本求和，无浮点参与）。
 - 唯一的浮点结果是 `ReplayStats.hit_rate = hits / accesses`，为 IEEE-754
   双精度除法的一次舍入；对本题规模（访问次数为普通整数）相对误差不超过
   2^-52 量级。测试中以 `==` 与同一表达式 `hits / accesses` 比对，不使用
@@ -86,6 +143,9 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   实现直白、易于手工核对；本题上限下总开销微不足道（demo 全程 < 0.1 秒）。
   未采用单次扫描算全部路数的栈式算法，以换取可验证性。
 - **先验证后计算**：所有参数在进入算法前集中校验，失败即抛，无部分结果。
+- **分阶段规划也用精确 DP**：以“当前路数向量”为状态按阶段前向递推，
+  状态数 ≤ 8³ = 512、阶段 ≤ 4，一次遍历即得全局最优；同样不假定曲线
+  单调或凸，并列由展平路径元组的字典序决定，无需贪心或搜索预算概念。
 
 ## 已知限制
 
@@ -93,11 +153,15 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   组间异构或运行时动态重划分。
 - 曲线按 `b % num_sets` 取组，不模拟物理地址哈希。
 - 上限（6 应用 / 16 组 / 12 路）是接口边界而非性能极限；超出即拒绝。
+- 分阶段规划只处理**已知阶段序列与已知离散曲线**：不实现不确定场景树、
+  非预知（non-anticipative）策略或鲁棒下界证书；阶段曲线由调用方直接
+  给定，本库不从访存轨迹模拟它们。迁移成本只支持线性单价加可选固定
+  切换费；任务数 3 / 阶段 4 / 路数 8 同为接口边界，超出即拒绝。
 - 不宣称完整行业标准兼容；仅实现本 README 所述契约。
 
 ## 测试与验证
 
-`tests/` 下 30 个用例：
+`tests/` 下 57 个用例：
 
 - `test_lru.py`：手工推算的 LRU 曲线（含循环冲突 thrash、组映射隔离、
   LRU≠FIFO 判别）与模拟器输入校验；
@@ -105,6 +169,11 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   贪心反例、不可行预算；以及**独立参考实现**（测试文件内自带的朴素
   列表式 LRU + 全枚举暴力搜索，不调用被测核心）在 60 个确定性随机小实例上
   与 DP 逐一比对分配向量与目标值；重放一致性为补充性往返核对；
+- `test_stages.py`：分阶段规划的手算用例（迁移成本改变最优、固定切换费、
+  `max_change` 强制绕行、多任务费用相加、零迁移退化、单阶段、逐阶段
+  最小路数）、全枚举与独立前向 DP 两套参考在 120 个确定性随机实例上
+  与被测 DP 逐一比对目标值和字典序最优向量、最大规模实例、以及类型/
+  取值/一致性/可定位错误消息/失败后无残留等校验；
 - `test_validation.py`：NaN/Infinity、bool、类型、边界、可定位错误消息、
   失败后无残留状态。
 
@@ -113,9 +182,10 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 ```
 wayplan/            # 可导入库（核心算法，纯标准库）
   __init__.py       # 公开接口导出
-  core.py           # 校验 + LRU 模拟 + DP 规划 + 隔离重放
+  core.py           # 校验 + LRU 模拟 + 分配 DP + 隔离重放 + 分阶段 DP
   errors.py         # 错误分类
 tests/              # unittest 测试（含独立参考实现）
-demo.py             # 固定输入演示：正常规划 / 贪心反例 / 实际触发的拒绝
+demo.py             # 固定输入演示：分配规划 / 贪心反例 / 拒绝 /
+                    #   分阶段规划（正常、max_change 边界、实际错误）
 README.md
 ```

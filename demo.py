@@ -16,8 +16,10 @@ import random
 
 from wayplan import (
     InfeasibleBudgetError,
+    TaskSpec,
     ValidationError,
     plan_allocation,
+    plan_stages,
     replay_isolated,
 )
 
@@ -144,10 +146,93 @@ def demo_rejections():
         print(f"infeasible budget     -> InfeasibleBudgetError: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Staged planning: known stage sequence + per-unit migration cost
+# ---------------------------------------------------------------------------
+
+def staged_demo_tasks():
+    # Two tasks, four known stages, three discrete way counts per stage.
+    # Loss curves are hand-set so the whole demo is checkable on paper:
+    #   X's per-stage optimum walks 1 -> 2 -> 3 -> 1 ways (last move = 2);
+    #   Y is happy at 1 way until stage 4, whose optimum is 2 ways.
+    x = TaskSpec("X", [
+        (0, 10, 20),   # stage 1 optimum: 1 way
+        (20, 0, 10),   # stage 2 optimum: 2 ways
+        (20, 10, 0),   # stage 3 optimum: 3 ways
+        (0, 10, 20),   # stage 4 optimum: 1 way (3 -> 1 is a 2-unit move)
+    ])
+    y = TaskSpec("Y", [
+        (0, 5, 10),
+        (0, 5, 10),
+        (0, 5, 10),
+        (10, 0, 5),    # stage 4 optimum: 2 ways
+    ])
+    return [x, y]
+
+
+def print_staged_plan(label, result):
+    print(f"{label}:")
+    for task_id, seq in result.ways_map().items():
+        print(f"  task {task_id}: ways per stage = {seq}")
+    print(f"  stage losses         : {result.stage_losses}")
+    print(f"  transition into stage: {result.transition_costs}")
+    print(f"  total = loss {result.total_loss} + migration "
+          f"{result.total_transition_cost} = {result.total_cost}")
+
+
+def demo_staged_planning():
+    section("4. Staged planning over a known 4-stage sequence (2 tasks)")
+    tasks = staged_demo_tasks()
+    print("loss curves per stage (columns = way counts 1, 2, 3):")
+    for t in tasks:
+        for s, curve in enumerate(t.losses):
+            print(f"  task {t.task_id} stage {s + 1}: {curve}")
+    print()
+    # Cheap re-routing: the planner follows every per-stage optimum.
+    # X moves 1->2->3->1 (4 moved units), Y moves 1->2 (1 unit): total 5.
+    print_staged_plan("migration_cost=1 (cheap to re-route)",
+                      plan_stages(tasks, migration_cost=1))
+    print()
+    # Expensive re-routing: following X's per-stage optima (1,2,3,1) moves
+    # 4 units at cost 6 = 24 just for X.  The exact DP skips the climb to
+    # 3 ways at stage 3: X stays at 2 then drops to 1 — 2 moved units
+    # (cost 12) against 10 extra stage-3 loss, total 22 for X instead of 24.
+    print_staged_plan("migration_cost=6 (re-routing is expensive)",
+                      plan_stages(tasks, migration_cost=6))
+
+
+def demo_staged_boundary_and_errors():
+    section("5. Staged planning: max_change boundary and real rejections")
+    tasks = staged_demo_tasks()
+    # Boundary: max_change=1 forbids X's 2-unit move into stage 4 (3->1).
+    # The exact DP skips the climb to 3 at stage 3 and stays at 2, so every
+    # move is at most one way: 10 extra loss, total 13 vs 5 with no cap.
+    capped = plan_stages(tasks, migration_cost=1, max_change=1)
+    print_staged_plan("max_change=1 (|delta ways| <= 1 per stage)", capped)
+    for seq in capped.ways:
+        for s in range(1, capped.num_stages):
+            assert abs(seq[s] - seq[s - 1]) <= 1
+    print("  (verified: no stage-to-stage move exceeds 1 way)")
+    uncapped = plan_stages(tasks, migration_cost=1)
+    print(f"  without the cap the optimum total is {uncapped.total_cost}; "
+          f"the cap costs {capped.total_cost - uncapped.total_cost}")
+    print()
+    try:
+        plan_stages(tasks, migration_cost=-1)
+    except ValidationError as e:
+        print(f"negative migration cost -> ValidationError: {e}")
+    try:
+        TaskSpec("Z", [(0,) * 9])  # 9 discrete way counts, limit is 8
+    except ValidationError as e:
+        print(f"9-way curve rejected     -> ValidationError: {e}")
+
+
 def main():
     demo_normal_planning()
     demo_greedy_counterexample()
     demo_rejections()
+    demo_staged_planning()
+    demo_staged_boundary_and_errors()
     print()
     print("demo finished: all numbers above were computed in this run.")
 

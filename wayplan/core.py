@@ -21,6 +21,7 @@ Each simulated cache is cold (empty) at the start of a run.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -31,6 +32,11 @@ from .errors import InfeasibleBudgetError, ValidationError
 MAX_APPS = 6
 MAX_SETS = 16
 MAX_WAYS = 12
+
+# Interface bounds for the staged (known-sequence) planning model.
+MAX_TASKS = 3
+MAX_STAGES = 4
+MAX_DYN_WAYS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +380,304 @@ def replay_isolated(traces, allocation, num_sets):
             )
         )
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Staged planning with known stage sequence and re-routing transition costs
+# ---------------------------------------------------------------------------
+#
+# Model (the discrete staged problem; it does NOT include scenario trees,
+# non-anticipative policies or robust lower bounds):
+#
+# * For each task, the ordered sequence of stages is known in advance, and
+#   each stage carries a discrete loss curve loss[stage][ways] over a fixed
+#   set of way counts 1..max_ways (at most MAX_DYN_WAYS).
+# * At every stage each task must be assigned an integer way count satisfying
+#   ``min_ways <= ways <= max_ways(stage)``; ``min_ways`` defaults to 1.
+# * Changing a task's way count between two consecutive stages costs
+#   ``migration_cost * |new_ways - old_ways|`` (linear per unit changed).
+#   In addition every actual change (|new - old| > 0) pays a fixed
+#   ``switch_cost`` (default 0); set both to 0 to disable transition costs.
+# * ``max_change`` (default: unlimited) caps |new_ways - old_ways| between
+#   consecutive stages.
+#
+# The planner is an exact dynamic program over stages with the current way
+# vector as its state, and backtracks the unique lexicographically smallest
+# optimum with stages outer and tasks (sorted by id) inner.  All quantities
+# are exact integers.
+
+
+@dataclass(frozen=True)
+class TaskSpec:
+    """One task's known stage sequence (validated, immutable).
+
+    ``losses``   — tuple of ``num_stages`` curves, each a tuple of length
+                   ``max_ways``; ``losses[s][w - 1]`` is the discrete
+                   performance value (loss) at stage ``s`` when routed with
+                   ``w`` ways.  Curves need not be monotone or convex.
+    ``min_ways`` — optional per-stage minimum way requirement; either a
+                   single positive int (applies to every stage) or a
+                   sequence of length ``num_stages``.
+    """
+
+    task_id: str
+    losses: tuple[tuple[int, ...], ...]
+    min_ways: tuple[int, ...]
+
+    def __init__(self, task_id, losses, min_ways=1):
+        if not isinstance(task_id, str) or not task_id:
+            raise ValidationError(
+                f"task_id: expected a non-empty str, got {task_id!r}"
+            )
+        if isinstance(losses, (str, bytes)) or not hasattr(losses, "__iter__"):
+            raise ValidationError(
+                f"losses of task {task_id!r}: expected an iterable of stage "
+                f"curves, got {type(losses).__name__}"
+            )
+        stages = []
+        for s, curve in enumerate(losses):
+            stages.append(
+                _require_loss_curve(
+                    curve, f"losses of task {task_id!r}, stage {s}"
+                )
+            )
+        if not stages:
+            raise ValidationError(
+                f"losses of task {task_id!r}: at least one stage is required"
+            )
+        if len(stages) > MAX_STAGES:
+            raise ValidationError(
+                f"losses of task {task_id!r}: at most {MAX_STAGES} stages are "
+                f"supported, got {len(stages)}"
+            )
+        if min_ways is None:
+            mins = (1,) * len(stages)
+        elif isinstance(min_ways, (str, bytes)) or not hasattr(
+            min_ways, "__iter__"
+        ):
+            mins = (
+                _require_int(
+                    min_ways, f"min_ways of task {task_id!r}", 1, MAX_DYN_WAYS
+                ),
+            ) * len(stages)
+        else:
+            mins_raw = list(min_ways)
+            if len(mins_raw) != len(stages):
+                raise ValidationError(
+                    f"min_ways of task {task_id!r}: expected 1 value or "
+                    f"{len(stages)} values (one per stage), got {len(mins_raw)}"
+                )
+            mins = tuple(
+                _require_int(
+                    m, f"min_ways of task {task_id!r}, stage {s}",
+                    1, MAX_DYN_WAYS,
+                )
+                for s, m in enumerate(mins_raw)
+            )
+        for s, (curve, lo) in enumerate(zip(stages, mins)):
+            if lo > len(curve):
+                raise ValidationError(
+                    f"min_ways of task {task_id!r}, stage {s}: minimum {lo} "
+                    f"exceeds the {len(curve)} way count(s) of that stage curve"
+                )
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "losses", tuple(stages))
+        object.__setattr__(self, "min_ways", mins)
+
+
+def _require_loss_curve(curve, name):
+    """Validate one discrete per-way loss curve: non-negative ints, 1..8 ways."""
+    if isinstance(curve, (str, bytes)) or not hasattr(curve, "__iter__"):
+        raise ValidationError(
+            f"{name}: expected an iterable of per-way loss values, "
+            f"got {type(curve).__name__}"
+        )
+    out = []
+    for w, value in enumerate(curve, start=1):
+        out.append(_require_int(value, f"{name}[{w - 1}] (ways={w})", 0))
+    if not out:
+        raise ValidationError(f"{name}: curve must cover at least 1 way")
+    if len(out) > MAX_DYN_WAYS:
+        raise ValidationError(
+            f"{name}: at most {MAX_DYN_WAYS} way counts are supported, "
+            f"got {len(out)}"
+        )
+    return tuple(out)
+
+
+def _normalize_tasks(tasks):
+    """Validate the task collection; return tasks in input order."""
+    if isinstance(tasks, (str, bytes)) or not hasattr(tasks, "__iter__"):
+        raise ValidationError(
+            f"tasks: expected an iterable of TaskSpec, "
+            f"got {type(tasks).__name__}"
+        )
+    out = []
+    for i, t in enumerate(tasks):
+        if not isinstance(t, TaskSpec):
+            raise ValidationError(
+                f"tasks[{i}]: expected a TaskSpec instance, got "
+                f"{type(t).__name__} ({t!r})"
+            )
+        out.append(t)
+    if not 1 <= len(out) <= MAX_TASKS:
+        raise ValidationError(
+            f"tasks: expected 1..{MAX_TASKS} tasks, got {len(out)}"
+        )
+    ids = [t.task_id for t in out]
+    if len(set(ids)) != len(ids):
+        dupes = sorted({x for x in ids if ids.count(x) > 1})
+        raise ValidationError(f"tasks: duplicate task_id(s): {dupes}")
+    num_stages = len(out[0].losses)
+    max_ways = len(out[0].losses[0])
+    for t in out[1:]:
+        if len(t.losses) != num_stages:
+            raise ValidationError(
+                f"tasks: task {t.task_id!r} has {len(t.losses)} stage(s), "
+                f"expected {num_stages} to match the other task(s)"
+            )
+        for s, curve in enumerate(t.losses):
+            if len(curve) != max_ways:
+                raise ValidationError(
+                    f"losses of task {t.task_id!r}, stage {s}: curve has "
+                    f"{len(curve)} way count(s), expected {max_ways} to match "
+                    f"the other curves"
+                )
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class StagePlanResult:
+    """Result of :func:`plan_stages`.  All fields are immutable."""
+
+    task_ids: tuple[str, ...]                # tasks sorted by task id
+    num_stages: int
+    migration_cost: int
+    switch_cost: int
+    max_change: int                          # MAX_DYN_WAYS encodes "unlimited"
+    ways: tuple[tuple[int, ...], ...]        # ways[task][stage]
+    stage_losses: tuple[int, ...]            # summed per-way losses per stage
+    transition_costs: tuple[int, ...]        # cost paid *into* stage s; [0]=0
+    total_loss: int                          # sum of stage_losses
+    total_transition_cost: int               # sum of transition_costs
+    total_cost: int                          # minimised objective
+
+    def ways_map(self):
+        """``{task_id: (ways per stage)}`` keyed by task id."""
+        return dict(zip(self.task_ids, self.ways))
+
+    def stage_ways_map(self):
+        """List with one ``{task_id: ways}`` allocation dict per stage."""
+        return [dict(zip(self.task_ids, col)) for col in zip(*self.ways)]
+
+
+def plan_stages(tasks, migration_cost=1, switch_cost=0, max_change=None):
+    """Plan way counts over a known stage sequence, minimising total cost.
+
+    Parameters
+    ----------
+    tasks          : iterable of 1..:data:`MAX_TASKS` :class:`TaskSpec`
+                     instances sharing a stage count (1..:data:`MAX_STAGES`)
+                     and curve length (1..:data:`MAX_DYN_WAYS`).
+    migration_cost : non-negative int paid per unit of way-count change
+                     between consecutive stages (linear in the difference).
+    switch_cost    : non-negative int paid once per task per actual change.
+    max_change     : positive int capping the way-count difference between
+                     consecutive stages, or ``None`` for no cap.
+
+    Returns a :class:`StagePlanResult`.  Among all plans attaining the
+    minimum total cost, the lexicographically smallest flattened way vector
+    is returned, with stages outer and tasks (sorted by id) inner, i.e. the
+    plan keeps the smallest feasible way counts at the earliest differing
+    stage/task.
+
+    Raises
+    ------
+    ValidationError — any contract violation.  There is no separate
+    infeasibility exception: every stage curve admits its own minimum way
+    count and all curves share one length, so a validated instance is always
+    feasible (``max_change`` cannot make stage 0 unreachable).
+    """
+    tasks_in = _normalize_tasks(tasks)
+    migration_cost = _require_int(migration_cost, "migration_cost", 0)
+    switch_cost = _require_int(switch_cost, "switch_cost", 0)
+    if max_change is not None:
+        max_change = _require_int(max_change, "max_change", 1, MAX_DYN_WAYS)
+    else:
+        max_change = MAX_DYN_WAYS  # >= any feasible difference, i.e. no cap
+
+    ordered = tuple(sorted(tasks_in, key=lambda t: t.task_id))
+    n = len(ordered)
+    num_stages = len(ordered[0].losses)
+    max_ways = len(ordered[0].losses[0])
+
+    # Per-stage feasible way counts for each task: [min_ways, max_ways].
+    feasible = [
+        [
+            tuple(range(t.min_ways[s], max_ways + 1))
+            for s in range(num_stages)
+        ]
+        for t in ordered
+    ]
+
+    # Exact DP over stages.  State key: tuple of current way counts (1-based);
+    # value: (best_cost, flattened_path).  Plain tuple comparison gives cost
+    # ordering with lexicographic tie-breaking in a single comparison.
+    states = {}
+    for combo in itertools.product(*(feasible[i][0] for i in range(n))):
+        loss = sum(ordered[i].losses[0][combo[i] - 1] for i in range(n))
+        states[combo] = (loss, tuple(combo))
+
+    for s in range(1, num_stages):
+        new_states = {}
+        for combo in itertools.product(*(feasible[i][s] for i in range(n))):
+            best = None
+            stage_loss = sum(
+                ordered[i].losses[s][combo[i] - 1] for i in range(n)
+            )
+            for prev, (prev_cost, prev_path) in states.items():
+                delta = 0
+                for i in range(n):
+                    d = abs(combo[i] - prev[i])
+                    if d > max_change:
+                        break  # infeasible transition: skip this predecessor
+                    if d:
+                        delta += migration_cost * d + switch_cost
+                else:
+                    cand = (prev_cost + stage_loss + delta, prev_path + combo)
+                    if best is None or cand < best:
+                        best = cand
+            if best is not None:
+                new_states[combo] = best
+        states = new_states
+
+    total_cost, flat = min(states.values())
+    ways = tuple(
+        tuple(flat[s * n + i] for s in range(num_stages))
+        for i in range(n)
+    )
+    stage_losses = tuple(
+        sum(ordered[i].losses[s][ways[i][s] - 1] for i in range(n))
+        for s in range(num_stages)
+    )
+    transition_costs = [0]
+    for s in range(1, num_stages):
+        delta = 0
+        for i in range(n):
+            d = abs(ways[i][s] - ways[i][s - 1])
+            if d:
+                delta += migration_cost * d + switch_cost
+        transition_costs.append(delta)
+    return StagePlanResult(
+        task_ids=tuple(t.task_id for t in ordered),
+        num_stages=num_stages,
+        migration_cost=migration_cost,
+        switch_cost=switch_cost,
+        max_change=max_change,
+        ways=ways,
+        stage_losses=tuple(stage_losses),
+        transition_costs=tuple(transition_costs),
+        total_loss=sum(stage_losses),
+        total_transition_cost=sum(transition_costs),
+        total_cost=total_cost,
+    )
