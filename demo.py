@@ -16,8 +16,12 @@ import random
 
 from wayplan import (
     InfeasibleBudgetError,
+    InfeasibleStageError,
+    Stage,
+    Task,
     ValidationError,
     plan_allocation,
+    plan_task_stages,
     replay_isolated,
 )
 
@@ -144,10 +148,66 @@ def demo_rejections():
         print(f"infeasible budget     -> InfeasibleBudgetError: {e}")
 
 
+def print_task_plan(p):
+    print(f"task {p.task_id!r}:")
+    print(f"{'stage':>6}{'ways':>6}{'loss':>7}{'migration':>11}")
+    for i, (w, lo, mi) in enumerate(p.stages()):
+        print(f"{i:>6}{w:>6}{lo:>7}{mi:>11}")
+    print(f"  stage loss {p.total_loss} + migration {p.total_migration_cost}"
+          f" = total {p.total_cost}")
+
+
+def demo_task_stages():
+    section("4. Multi-stage planning (known stage sequences, 8 ways max)")
+    # One service with a hand-built 4-stage sequence, num_ways=4.
+    # Off-peak stages 0/3 reward many ways: curve (80, 40, 10, 5),
+    #   performance floor loss <= 60  -> feasible ways {2, 3, 4}.
+    # Peak stages 1/2 reward few ways: curve (90, 8, 30, 70),
+    #   floor loss <= 30              -> feasible ways {2, 3}.
+    stages = [
+        Stage(1, 60, [80, 40, 10, 5]),
+        Stage(1, 30, [90, 8, 30, 70]),
+        Stage(1, 30, [90, 8, 30, 70]),
+        Stage(1, 60, [80, 40, 10, 5]),
+    ]
+    cheap = plan_task_stages([Task("svc", stages)], num_ways=4,
+                             migration_cost=6, max_change=1)
+    print("migration_cost=6, max_change=1:")
+    print_task_plan(cheap.plans[0])
+    print("  (moving 3->2->2->3 pays the fee twice: 36 + 2*6 = 48)")
+    dear = plan_task_stages([Task("svc", stages)], num_ways=4,
+                            migration_cost=30, max_change=1)
+    print("migration_cost=30, max_change=1:")
+    print_task_plan(dear.plans[0])
+    print("  (staying at 3 ways avoids all fees: 80 < 36 + 2*30 = 96)")
+
+    # A second, independent task planned in the same call, with a per-task
+    # migration override: 2 stages whose cheapest counts are far apart,
+    # but max_change=1 forbids the direct jump in one go... here each
+    # boundary must move at most 1 way.
+    print()
+    rigid = Task(
+        "rigid",
+        [Stage(4, 9, [9, 9, 9, 9]), Stage(1, 0, [0, 5, 5, 5])],
+        max_change=1,
+    )
+    try:
+        plan_task_stages([rigid], num_ways=4)
+    except InfeasibleStageError as e:
+        print(f"provably unreachable -> InfeasibleStageError: {e}")
+
+    # Malformed input: loss curve shorter than num_ways.
+    try:
+        plan_task_stages([Task("bad", [Stage(1, 9, [9, 1])])], num_ways=4)
+    except ValidationError as e:
+        print(f"malformed curve      -> ValidationError: {e}")
+
+
 def main():
     demo_normal_planning()
     demo_greedy_counterexample()
     demo_rejections()
+    demo_task_stages()
     print()
     print("demo finished: all numbers above were computed in this run.")
 

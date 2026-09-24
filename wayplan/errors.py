@@ -12,9 +12,15 @@ Error semantics (fixed public contract):
   the planner uses an exact, complete dynamic program, so "search budget
   exhausted" cannot occur and is therefore represented by no exception
   at all.  The two situations are never conflated.
+- ``InfeasibleStageError`` — valid input to the multi-stage planner, but
+  a stage's minimum-performance requirement has no satisfying way count,
+  or no satisfying count is reachable from the previous stage within
+  ``max_change``.  Again a proved-infeasible result from an exact DP,
+  never a timeout, and distinct from malformed input.
 
-Both derive from ``WayPlanError`` so callers can catch one base class.
-``ValidationError`` also derives from ``ValueError`` for idiomatic use.
+All three derive from ``WayPlanError`` so callers can catch one base
+class.  ``ValidationError`` also derives from ``ValueError`` for
+idiomatic use.
 """
 
 
@@ -28,3 +34,7 @@ class ValidationError(WayPlanError, ValueError):
 
 class InfeasibleBudgetError(WayPlanError):
     """Valid input, but the way budget cannot cover one way per app."""
+
+
+class InfeasibleStageError(WayPlanError):
+    """Valid input, but the multi-stage constraints are unsatisfiable."""
