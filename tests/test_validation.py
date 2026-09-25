@@ -23,11 +23,14 @@ def plan(**overrides):
     args = dict(
         traces=GOOD_TRACES, weights=GOOD_WEIGHTS,
         num_sets=2, total_ways=4, budget=3,
+        miss_caps=None, deactivation_penalties=None,
     )
     args.update(overrides)
     return plan_allocation(
         args["traces"], args["weights"], args["num_sets"],
         args["total_ways"], args["budget"],
+        miss_caps=args["miss_caps"],
+        deactivation_penalties=args["deactivation_penalties"],
     )
 
 
@@ -83,6 +86,11 @@ class RangeContract(unittest.TestCase):
         with self.assertRaises(ValidationError):
             plan(total_ways=MAX_WAYS + 1)
         with self.assertRaises(ValidationError):
+            plan(budget=-1)
+        # budget=0 is valid input since v1.1 (deactivation can make it
+        # feasible); with two mandatory (non-deactivatable) applications
+        # it is provably infeasible, which is NOT a validation error.
+        with self.assertRaises(InfeasibleBudgetError):
             plan(budget=0)
         # budget may not exceed total_ways (cannot hand out ways that
         # do not exist in the cache being partitioned)
@@ -137,7 +145,7 @@ class ErrorSemantics(unittest.TestCase):
             (dict(weights=[1, -1]), "weights[1]"),
             (dict(num_sets=99), "num_sets"),
             (dict(total_ways=0), "total_ways"),
-            (dict(budget=0), "budget"),
+            (dict(budget=-1), "budget"),
             (dict(traces=[("a", [0, -5]), ("b", [1])]), "blocks"),
         ]
         for kwargs, needle in cases:
@@ -165,6 +173,58 @@ class ErrorSemantics(unittest.TestCase):
             miss_curve([1], 1, 0)
         with self.assertRaises(ValidationError):
             miss_curve([1], 1, MAX_WAYS + 1)
+
+
+class OptionalConstraintContract(unittest.TestCase):
+    """Validation of miss_caps and deactivation_penalties (v1.1)."""
+
+    def test_miss_caps_contract(self):
+        with self.assertRaises(ValidationError):  # wrong length
+            plan(miss_caps=[None])
+        with self.assertRaises(ValidationError):  # negative cap
+            plan(miss_caps=[None, -1])
+        with self.assertRaises(ValidationError):  # bool is not an int
+            plan(miss_caps=[None, True])
+        with self.assertRaises(ValidationError):  # non-integral float
+            plan(miss_caps=[2.5, None])
+        with self.assertRaises(ValidationError):  # NaN
+            plan(miss_caps=[math.nan, None])
+        with self.assertRaises(ValidationError):  # not an iterable
+            plan(miss_caps=5)
+        # cap 0 is legal input (no active way count can satisfy it, since
+        # a cold non-empty trace always misses at least once — it forces
+        # deactivation or infeasibility, never a validation error)
+        r = plan(miss_caps=[0, None], deactivation_penalties=[4, None])
+        self.assertEqual(r.deactivated, (True, False))
+        self.assertEqual(r.objective, 4 + 2 * r.per_app_misses[1])
+
+    def test_deactivation_penalties_contract(self):
+        with self.assertRaises(ValidationError):  # wrong length
+            plan(deactivation_penalties=[None])
+        with self.assertRaises(ValidationError):  # negative penalty
+            plan(deactivation_penalties=[None, -2])
+        with self.assertRaises(ValidationError):  # bool is not an int
+            plan(deactivation_penalties=[False, None])
+        with self.assertRaises(ValidationError):  # non-integral float
+            plan(deactivation_penalties=[1.5, None])
+        with self.assertRaises(ValidationError):  # not an iterable
+            plan(deactivation_penalties="x")
+        # penalty 0 is legal: deactivation is free (still counts as a
+        # deactivation in the second optimisation key).  Here app "a" has
+        # a flat curve (2 misses at any way count, weight 1), so dropping
+        # it for free beats keeping it (cost >= 2).
+        r = plan(deactivation_penalties=[0, None])
+        self.assertEqual(r.allocation, (0, 1))
+        self.assertEqual(r.objective, 4)
+        self.assertEqual(r.deactivation_count, 1)
+
+    def test_messages_are_locatable_for_new_params(self):
+        with self.assertRaises(ValidationError) as ctx:
+            plan(miss_caps=[None, -1])
+        self.assertIn("miss_caps[1]", str(ctx.exception))
+        with self.assertRaises(ValidationError) as ctx:
+            plan(deactivation_penalties=[-3, None])
+        self.assertIn("deactivation_penalties[0]", str(ctx.exception))
 
 
 if __name__ == "__main__":

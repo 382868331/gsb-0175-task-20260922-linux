@@ -6,12 +6,22 @@ Pipeline (all exact, no convexity assumption, no greedy heuristic):
    a set-associative LRU cache independently at every way count
    1..total_ways and record the miss count (the "per-way curve").
 2. ``plan_allocation`` — exact dynamic program over (app, remaining budget)
-   choosing an integer way count >= 1 per application, total <= budget,
-   minimising the weighted miss sum with positive integer weights.
-   Ties are broken by the lexicographically smallest allocation vector
-   with applications ordered by app id.
-3. ``replay_isolated`` — re-run each application on its own isolated cache
-   sized to its allocated ways and report hit/miss statistics.
+   choosing, per application, either an integer way count >= 1 or — only
+   when the application was explicitly declared deactivatable — deactivation
+   at a declared integer penalty.  Optional per-application hard miss caps
+   are enforced *inside* the DP (an allocation that violates any cap is
+   simply not a candidate); they are never handled by computing an
+   unconstrained optimum first and repairing it locally, which would be
+   unsound because miss curves are not guaranteed to be convex.
+   Optimisation order (lexicographic): (1) objective = weighted miss sum
+   of active applications + deactivation penalties, (2) number of
+   deactivated applications, (3) allocation vector with applications
+   ordered by app id (0 = deactivated, which sorts before any way count).
+3. ``replay_isolated`` / ``verify_plan`` — re-run applications on their own
+   isolated caches.  ``verify_plan`` takes a :class:`PlanResult` (which
+   retains the full final state of the planner) and confirms every hard
+   constraint — way budget, per-app miss caps, deactivation declarations,
+   objective arithmetic — by actual replay on cold isolated caches.
 
 Address model: the input is a sequence of *block addresses* (non-negative
 ints, block granularity — the block offset is already removed).  A block
@@ -153,6 +163,37 @@ def _normalize_weights(weights, app_ids):
     return tuple(out)
 
 
+def _normalize_optional_per_app(values, n, name):
+    """Normalise an optional per-application parameter.
+
+    ``None`` (the whole parameter) means "not declared for any application"
+    and yields an all-``None`` tuple.  Otherwise ``values`` must be an
+    iterable of exactly ``n`` entries aligned with the traces input order;
+    each entry is either ``None`` (not declared for that application) or a
+    non-negative int.
+    """
+    if values is None:
+        return (None,) * n
+    if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
+        raise ValidationError(
+            f"{name}: expected None or an iterable of {n} entries "
+            f"(None or non-negative int), got {type(values).__name__}"
+        )
+    vs = list(values)
+    if len(vs) != n:
+        raise ValidationError(
+            f"{name}: expected {n} entries (one per application, aligned "
+            f"with traces order), got {len(vs)}"
+        )
+    out = []
+    for i, v in enumerate(vs):
+        if v is None:
+            out.append(None)
+        else:
+            out.append(_require_int(v, f"{name}[{i}]", 0))
+    return tuple(out)
+
+
 # ---------------------------------------------------------------------------
 # LRU simulation
 # ---------------------------------------------------------------------------
@@ -202,7 +243,13 @@ def miss_curve(blocks, num_sets, max_ways):
 
 @dataclass(frozen=True)
 class PlanResult:
-    """Result of :func:`plan_allocation`.  All fields are immutable."""
+    """Result of :func:`plan_allocation`.  All fields are immutable.
+
+    The result retains the complete final state of the planner (curves,
+    caps, penalties, allocation, objective components) so that
+    :func:`verify_plan` — or any external checker — can re-validate every
+    hard constraint by replay, without trusting the planner.
+    """
 
     num_sets: int
     total_ways: int
@@ -210,17 +257,80 @@ class PlanResult:
     app_ids: tuple[str, ...]              # sorted by app id
     weights: tuple[int, ...]              # aligned with app_ids
     curves: tuple[tuple[int, ...], ...]   # curves[i][w-1] = misses of app i with w ways
-    allocation: tuple[int, ...]           # ways per app, aligned with app_ids
-    per_app_misses: tuple[int, ...]       # misses at the allocated way count
-    weighted_misses: int                  # minimised objective value
+    allocation: tuple[int, ...]           # ways per app (0 = deactivated), aligned with app_ids
+    per_app_misses: tuple[int, ...]       # misses at the allocated way count (None if deactivated)
+    weighted_misses: int                  # weighted miss sum over active apps
     used_ways: int                        # sum(allocation), always <= budget
+    miss_caps: tuple                      # per-app hard miss cap (None = uncapped), aligned with app_ids
+    deactivation_penalties: tuple         # per-app deactivation penalty (None = may not be deactivated)
+    deactivated: tuple[bool, ...]         # True where the app is deactivated (allocation 0)
+    deactivation_count: int               # number of deactivated apps
+    deactivation_cost: int                # sum of penalties of deactivated apps
+    objective: int                        # weighted_misses + deactivation_cost (primary minimised key)
 
     def allocation_map(self):
-        """Allocation as an insertion-ordered dict keyed by app id."""
+        """Allocation as an insertion-ordered dict keyed by app id.
+
+        Deactivated applications appear with value 0.
+        """
         return dict(zip(self.app_ids, self.allocation))
 
+    def deactivated_app_ids(self):
+        """Ids of deactivated applications, ordered by app id."""
+        return tuple(
+            app_id
+            for app_id, off in zip(self.app_ids, self.deactivated)
+            if off
+        )
 
-def plan_allocation(traces, weights, num_sets, total_ways, budget):
+
+def _infeasible(app_ids, caps, pens, curves, total_ways, budget):
+    """Build the proved-infeasible error with necessary-condition diagnostics."""
+    per_app = []
+    parts = []
+    for i, app_id in enumerate(app_ids):
+        cap = caps[i]
+        if cap is None:
+            min_ways = 1
+        else:
+            min_ways = next(
+                (a for a in range(1, total_ways + 1) if curves[i][a - 1] <= cap),
+                None,
+            )
+        deactivatable = pens[i] is not None
+        per_app.append(
+            {
+                "app_id": app_id,
+                "min_ways_if_active": min_ways,
+                "deactivatable": deactivatable,
+                "penalty": pens[i],
+            }
+        )
+        if min_ways is None:
+            part = f"{app_id}: miss cap {cap} unachievable with 1..{total_ways} way(s)"
+        else:
+            part = f"{app_id}: >= {min_ways} way(s)"
+        if deactivatable:
+            part += f" (or deactivate, penalty {pens[i]})"
+        parts.append(part)
+    diagnostics = {
+        "budget": budget,
+        "total_ways": total_ways,
+        "per_app": tuple(per_app),
+    }
+    return InfeasibleBudgetError(
+        f"budget: {budget} way(s) cannot satisfy {len(app_ids)} application(s) "
+        f"under the declared hard miss caps and deactivation options; "
+        f"per-app independent minimum requirements: {'; '.join(parts)}. "
+        f"These minima are a necessary condition only, not a general "
+        f"infeasibility proof; feasibility itself is decided by the exact, "
+        f"complete planner (no search budget exists to exhaust).",
+        diagnostics=diagnostics,
+    )
+
+
+def plan_allocation(traces, weights, num_sets, total_ways, budget,
+                    miss_caps=None, deactivation_penalties=None):
     """Choose integer way counts minimising the weighted miss sum.
 
     Parameters
@@ -232,36 +342,55 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
     num_sets   : 1..16, sets of the (shared) cache being partitioned.
     total_ways : 1..12, associativity of the cache; miss curves are
                  computed for 1..total_ways ways per app.
-    budget     : 1..total_ways, maximum total ways handed out.
+    budget     : 0..total_ways, maximum total ways handed out.  0 is legal
+                 since v1.1: it is feasible exactly when every application
+                 is deactivatable.
+    miss_caps  : optional; None, or an iterable aligned with ``traces``
+                 order whose entries are None (no cap) or a non-negative
+                 int hard cap on that application's miss count.  Caps are
+                 enforced inside the exact DP — any allocation exceeding a
+                 cap is infeasible, never repaired after the fact.
+    deactivation_penalties : optional; None, or an iterable aligned with
+                 ``traces`` order whose entries are None (application may
+                 not be deactivated — it keeps its mandatory minimum of one
+                 way) or a non-negative int penalty paid when the
+                 application is deactivated.  A deactivated application
+                 occupies no ways, contributes its penalty to the objective
+                 instead of misses, and is reported separately.
 
-    Returns a :class:`PlanResult`.  Among all allocations with the minimal
-    weighted miss sum, the lexicographically smallest allocation vector
-    (apps ordered by app id) is returned.
+    Returns a :class:`PlanResult`.  Optimisation order is lexicographic:
+    (1) objective = weighted miss sum of active apps + deactivation
+    penalties, (2) number of deactivated apps, (3) allocation vector with
+    apps ordered by app id (0 = deactivated sorts before any way count).
 
     Raises
     ------
     ValidationError        — any contract violation in the inputs.
-    InfeasibleBudgetError  — budget < number of applications (proved
-                             infeasible; the DP itself is exact and complete,
-                             so no "search exhausted" outcome exists).
+    InfeasibleBudgetError  — no allocation satisfies every hard constraint
+                             within the budget (proved infeasible by the
+                             exact, complete DP; the exception carries
+                             per-app necessary-condition diagnostics).
     """
     apps_in = _normalize_traces(traces)
+    n = len(apps_in)
     ws_in = _normalize_weights(weights, [t.app_id for t in apps_in])
+    caps_in = _normalize_optional_per_app(miss_caps, n, "miss_caps")
+    pens_in = _normalize_optional_per_app(
+        deactivation_penalties, n, "deactivation_penalties"
+    )
     num_sets = _require_num_sets(num_sets)
     total_ways = _require_int(total_ways, "total_ways", 1, MAX_WAYS)
-    budget = _require_int(budget, "budget", 1, total_ways)
+    budget = _require_int(budget, "budget", 0, total_ways)
 
-    # Pair each trace with its weight *before* sorting, so weights stay
-    # aligned with the application they were supplied for.
-    paired = sorted(zip(apps_in, ws_in), key=lambda p: p[0].app_id)
+    # Pair each trace with its weight, cap and penalty *before* sorting, so
+    # all per-app parameters stay aligned with their application.
+    paired = sorted(
+        zip(apps_in, ws_in, caps_in, pens_in), key=lambda p: p[0].app_id
+    )
     apps = tuple(p[0] for p in paired)
     ws = tuple(p[1] for p in paired)
-    n = len(apps)
-    if budget < n:
-        raise InfeasibleBudgetError(
-            f"budget: {budget} way(s) cannot give each of the {n} "
-            f"application(s) its mandatory minimum of 1 way"
-        )
+    caps = tuple(p[2] for p in paired)
+    pens = tuple(p[3] for p in paired)
 
     curves = tuple(miss_curve(t.blocks, num_sets, total_ways) for t in apps)
     # cost[i][a] = weighted misses of app i when given a ways (a in 1..total_ways)
@@ -270,36 +399,53 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
         for i in range(n)
     ]
 
-    # best[i][b] = (min_cost, allocation_tuple) for apps i..n-1 with a total
-    # of at most b ways, or None when infeasible.  Processed back to front;
-    # tuple comparison gives exact cost ordering with lexicographic
-    # tie-breaking on the allocation vector in one pass.
+    # mandatory_after[i] = number of apps after i that may NOT be deactivated
+    # and therefore each need >= 1 way.  Deactivatable apps need 0.
+    mandatory_after = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        mandatory_after[i] = mandatory_after[i + 1] + (1 if pens[i] is None else 0)
+
+    # best[i][b] = (objective, deactivation_count, allocation_tuple) for
+    # apps i..n-1 with a total of at most b ways, or None when infeasible.
+    # Processed back to front; tuple comparison gives the exact
+    # lexicographic optimisation order (objective, deactivation count,
+    # allocation vector) in one pass.
     best = [[None] * (budget + 1) for _ in range(n + 1)]
     for b in range(budget + 1):
-        best[n][b] = (0, ())  # no apps left: leftover budget stays unused
+        best[n][b] = (0, 0, ())  # no apps left: leftover budget stays unused
     for i in range(n - 1, -1, -1):
-        remaining_after = n - 1 - i  # apps after i, each needs >= 1 way
         for b in range(budget + 1):
-            top = min(total_ways, b - remaining_after)
-            if top < 1:
-                continue  # infeasible: not enough ways left for app i
             chosen = None
+            # Option 1: deactivate app i (only if explicitly declared).
+            if pens[i] is not None:
+                tail = best[i + 1][b]
+                if tail is not None:
+                    chosen = (pens[i] + tail[0], 1 + tail[1], (0,) + tail[2])
+            # Option 2: give app i a ways; its hard cap (if any) must hold.
+            top = min(total_ways, b - mandatory_after[i + 1])
+            cap = caps[i]
             for a in range(1, top + 1):
+                if cap is not None and curves[i][a - 1] > cap:
+                    continue  # hard cap: this way count is not a candidate
                 tail = best[i + 1][b - a]
                 if tail is None:
                     continue
-                cand = (cost[i][a] + tail[0], (a,) + tail[1])
+                cand = (cost[i][a] + tail[0], tail[1], (a,) + tail[2])
                 if chosen is None or cand < chosen:
                     chosen = cand
             best[i][b] = chosen
 
     final = best[0][budget]
-    if final is None:  # unreachable given the checks above; defensive
-        raise InfeasibleBudgetError(
-            f"budget: {budget} way(s) infeasible for {n} application(s)"
+    if final is None:
+        raise _infeasible(
+            tuple(t.app_id for t in apps), caps, pens, curves, total_ways, budget
         )
-    total_cost, alloc = final
-    per_app = tuple(curves[i][alloc[i] - 1] for i in range(n))
+    objective, deact_count, alloc = final
+    deactivated = tuple(a == 0 for a in alloc)
+    per_app = tuple(
+        None if deactivated[i] else curves[i][alloc[i] - 1] for i in range(n)
+    )
+    deact_cost = sum(pens[i] for i in range(n) if deactivated[i])
     return PlanResult(
         num_sets=num_sets,
         total_ways=total_ways,
@@ -309,8 +455,14 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
         curves=curves,
         allocation=alloc,
         per_app_misses=per_app,
-        weighted_misses=total_cost,
+        weighted_misses=objective - deact_cost,
         used_ways=sum(alloc),
+        miss_caps=caps,
+        deactivation_penalties=pens,
+        deactivated=deactivated,
+        deactivation_count=deact_count,
+        deactivation_cost=deact_cost,
+        objective=objective,
     )
 
 
@@ -338,6 +490,9 @@ def replay_isolated(traces, allocation, num_sets):
     by app id.  The replay is independent of the planning run (cold caches),
     so its miss counts must match the planned curves — a consistency check
     the test-suite performs rather than assumes.
+
+    Deactivated applications (0 ways) are not accepted here; use
+    :func:`verify_plan` to replay a plan that contains deactivations.
     """
     apps = _normalize_traces(traces)
     num_sets = _require_num_sets(num_sets)
@@ -374,3 +529,187 @@ def replay_isolated(traces, allocation, num_sets):
             )
         )
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Replay-based verification of a finished plan
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PlanVerification:
+    """Outcome of :func:`verify_plan`.
+
+    ``ok`` is True only when every hard constraint of the plan was
+    confirmed by actual replay.  ``failures`` lists each violated or
+    inconsistent constraint in locatable form.  ``replay`` holds the
+    replay statistics of the active applications (ordered by app id);
+    ``deactivated`` lists the deactivated application ids separately.
+    """
+
+    ok: bool
+    failures: tuple[str, ...]
+    replay: tuple[ReplayStats, ...]
+    deactivated: tuple[str, ...]
+
+
+def verify_plan(result, traces):
+    """Re-check every hard constraint of a :class:`PlanResult` by replay.
+
+    The planner's final state (curves, caps, penalties, allocation,
+    objective components) is fully retained in ``result``; this function
+    re-simulates each active application on a cold isolated cache of its
+    allocated ways and confirms, independently of the planning run:
+
+    - every active application's replayed misses equal the recorded
+      ``per_app_misses`` and the recorded curve value at its way count;
+    - every hard miss cap holds for the replayed miss count;
+    - deactivated applications were explicitly declared deactivatable and
+      occupy 0 ways; non-declared applications hold at least one way;
+    - ``used_ways`` equals the allocation sum and does not exceed budget;
+    - ``deactivation_count`` / ``deactivation_cost`` / ``weighted_misses``
+      / ``objective`` are arithmetically consistent.
+
+    Structural problems (``result`` is not a PlanResult, app ids do not
+    match ``traces``, field lengths disagree) raise ``ValidationError``.
+    Constraint violations found by replay do not raise; they are reported
+    in the returned :class:`PlanVerification` with ``ok == False``.
+    """
+    if not isinstance(result, PlanResult):
+        raise ValidationError(
+            f"result: expected PlanResult, got {type(result).__name__}"
+        )
+    apps = _normalize_traces(traces)
+    by_id = {t.app_id: t for t in apps}
+    if tuple(sorted(by_id)) != result.app_ids:
+        raise ValidationError(
+            f"traces: app ids {sorted(by_id)} do not match "
+            f"result.app_ids {list(result.app_ids)}"
+        )
+    n = len(result.app_ids)
+    for field_name in (
+        "weights", "curves", "allocation", "per_app_misses",
+        "miss_caps", "deactivation_penalties", "deactivated",
+    ):
+        if len(getattr(result, field_name)) != n:
+            raise ValidationError(
+                f"result.{field_name}: length does not match result.app_ids"
+            )
+
+    failures = []
+    replay = []
+    deactivated_ids = []
+    alloc_all_ints = True
+    for i, app_id in enumerate(result.app_ids):
+        t = by_id[app_id]
+        a = result.allocation[i]
+        if isinstance(a, bool) or not isinstance(a, int) or not 0 <= a <= result.total_ways:
+            failures.append(
+                f"app {app_id!r}: allocation {a!r} is not an int in "
+                f"0..{result.total_ways}"
+            )
+            alloc_all_ints = False
+            continue
+        if bool(result.deactivated[i]) != (a == 0):
+            failures.append(
+                f"app {app_id!r}: deactivated flag {result.deactivated[i]!r} "
+                f"disagrees with allocation {a}"
+            )
+        if a == 0:
+            if result.deactivation_penalties[i] is None:
+                failures.append(
+                    f"app {app_id!r}: deactivated but no deactivation "
+                    f"penalty was declared for it"
+                )
+            if result.per_app_misses[i] is not None:
+                failures.append(
+                    f"app {app_id!r}: deactivated but per_app_misses is "
+                    f"{result.per_app_misses[i]!r}, expected None"
+                )
+            deactivated_ids.append(app_id)
+            continue
+        # Active app: confirm its constraint state by actual replay.
+        misses = simulate_lru_misses(t.blocks, result.num_sets, a)
+        if result.per_app_misses[i] != misses:
+            failures.append(
+                f"app {app_id!r}: recorded per_app_misses "
+                f"{result.per_app_misses[i]!r} != replayed {misses}"
+            )
+        if a > len(result.curves[i]) or result.curves[i][a - 1] != misses:
+            failures.append(
+                f"app {app_id!r}: recorded curve disagrees with replay at "
+                f"{a} way(s)"
+            )
+        cap = result.miss_caps[i]
+        if cap is not None and misses > cap:
+            failures.append(
+                f"app {app_id!r}: hard miss cap violated — replayed "
+                f"{misses} miss(es) > cap {cap}"
+            )
+        accesses = len(t.blocks)
+        hits = accesses - misses
+        replay.append(
+            ReplayStats(
+                app_id=app_id,
+                ways=a,
+                accesses=accesses,
+                hits=hits,
+                misses=misses,
+                hit_rate=hits / accesses,
+            )
+        )
+
+    if alloc_all_ints:
+        if sum(result.allocation) != result.used_ways:
+            failures.append(
+                f"used_ways {result.used_ways} != sum of allocation "
+                f"{sum(result.allocation)}"
+            )
+    if result.used_ways > result.budget:
+        failures.append(
+            f"used_ways {result.used_ways} exceeds budget {result.budget}"
+        )
+    if sum(1 for d in result.deactivated if d) != result.deactivation_count:
+        failures.append(
+            f"deactivation_count {result.deactivation_count} != number of "
+            f"deactivated flags"
+        )
+    pen_total = sum(
+        result.deactivation_penalties[i]
+        for i in range(n)
+        if result.deactivated[i]
+        and isinstance(result.deactivation_penalties[i], int)
+        and not isinstance(result.deactivation_penalties[i], bool)
+    )
+    if pen_total != result.deactivation_cost:
+        failures.append(
+            f"deactivation_cost {result.deactivation_cost} != sum of "
+            f"penalties of deactivated apps {pen_total}"
+        )
+    if all(
+        result.per_app_misses[i] is not None
+        for i in range(n)
+        if not result.deactivated[i]
+    ):
+        weighted = sum(
+            result.weights[i] * result.per_app_misses[i]
+            for i in range(n)
+            if not result.deactivated[i]
+        )
+        if weighted != result.weighted_misses:
+            failures.append(
+                f"weighted_misses {result.weighted_misses} != recomputed "
+                f"{weighted}"
+            )
+    if result.weighted_misses + result.deactivation_cost != result.objective:
+        failures.append(
+            f"objective {result.objective} != weighted_misses "
+            f"{result.weighted_misses} + deactivation_cost "
+            f"{result.deactivation_cost}"
+        )
+
+    return PlanVerification(
+        ok=not failures,
+        failures=tuple(failures),
+        replay=tuple(replay),
+        deactivated=tuple(deactivated_ids),
+    )

@@ -1,12 +1,18 @@
 """Deterministic offline demo for the wayplan library.
 
-Runs three real computations (no sleeps, no prerecorded output):
+Runs real computations (no sleeps, no prerecorded output), all well under
+the 90-second demo budget (measured < 1 second total):
 
   1. a normal 3-app planning run: per-way miss curves, the exact optimal
      allocation, and replay statistics on the isolated caches;
   2. a hand-built counterexample where marginal-gain greedy is provably
      worse than the exact planner;
-  3. two genuinely triggered rejections (NaN weight, infeasible budget).
+  3. hard per-app miss caps + optional paid deactivation: the caps are
+     enforced inside the exact DP (never repaired after the fact), the
+     deactivated app is reported separately, and verify_plan re-confirms
+     every hard constraint by actual replay;
+  4. genuinely triggered rejections (NaN weight, infeasible budget, and an
+     unachievable hard cap with its necessary-condition diagnostics).
 
 Everything is computed from deterministic in-repo data (fixed seeds).
 """
@@ -19,6 +25,7 @@ from wayplan import (
     ValidationError,
     plan_allocation,
     replay_isolated,
+    verify_plan,
 )
 
 
@@ -130,8 +137,61 @@ def demo_greedy_counterexample():
           f"never reaches after spending ways on appA's early gain.")
 
 
+def demo_caps_and_deactivation():
+    section("3. Hard miss caps + optional paid deactivation (num_sets=1)")
+    # critical: [0,1,2] cycled -> curve (24,24,3,3,3,3); hard cap 6 misses
+    #   forces >= 3 ways.  weight 2.
+    # batch:    [3,4,5,6] cycled -> curve (24,24,24,4,4,4); declared
+    #   deactivatable at penalty 20.  weight 1.
+    # stream:   single hot block -> curve (1,1,1,1,1,1).  weight 1.
+    critical = [0, 1, 2] * 8
+    batch = [3, 4, 5, 6] * 6
+    stream = [7] * 30
+    traces = [("critical", critical), ("batch", batch), ("stream", stream)]
+    weights = [2, 1, 1]
+
+    plain = plan_allocation(traces, weights, num_sets=1, total_ways=6, budget=6)
+    print("unconstrained reference (no caps, no deactivation):")
+    print(f"  allocation {plain.allocation_map()}  "
+          f"weighted misses {plain.weighted_misses}")
+    print()
+
+    result = plan_allocation(
+        traces, weights, num_sets=1, total_ways=6, budget=6,
+        miss_caps=[6, None, None],            # critical may miss at most 6
+        deactivation_penalties=[None, 20, None],  # only batch may be dropped
+    )
+    print_curves(result)
+    print()
+    print("with hard cap critical<=6 and batch deactivatable (penalty 20):")
+    print(f"  allocation (0 = deactivated): {result.allocation_map()}")
+    print(f"  deactivated apps (reported separately): "
+          f"{result.deactivated_app_ids()}")
+    print(f"  weighted misses {result.weighted_misses} + deactivation "
+          f"penalties {result.deactivation_cost} = objective "
+          f"{result.objective}")
+    print(f"  used ways: {result.used_ways} / budget {result.budget}")
+    print("  keeping batch would cost 24 misses at any way count it can "
+          "get here;")
+    print("  paying the penalty of 20 is strictly cheaper, so the exact "
+          "planner deactivates it.")
+    print()
+
+    ver = verify_plan(result, traces)
+    print(f"verify_plan replay check: ok={ver.ok} "
+          f"(failures: {list(ver.failures)})")
+    print(f"  deactivated as reported by replay: {ver.deactivated}")
+    print_replay(ver.replay)
+    for s in ver.replay:
+        i = result.app_ids.index(s.app_id)
+        cap = result.miss_caps[i]
+        if cap is not None:
+            print(f"  hard cap confirmed by replay: {s.app_id} misses "
+                  f"{s.misses} <= cap {cap}")
+
+
 def demo_rejections():
-    section("3. Genuinely triggered rejections")
+    section("4. Genuinely triggered rejections")
     try:
         plan_allocation([("a", [0, 1]), ("b", [2])], [1, math.nan],
                         num_sets=2, total_ways=4, budget=3)
@@ -142,11 +202,20 @@ def demo_rejections():
                         num_sets=2, total_ways=4, budget=2)
     except InfeasibleBudgetError as e:
         print(f"infeasible budget     -> InfeasibleBudgetError: {e}")
+    try:
+        # critical's curve bottoms out at 3 misses; cap 2 is unachievable
+        # and the app may not be deactivated -> proved infeasible.
+        plan_allocation([("critical", [0, 1, 2] * 8)], [1],
+                        num_sets=1, total_ways=6, budget=6, miss_caps=[2])
+    except InfeasibleBudgetError as e:
+        print(f"unachievable hard cap -> InfeasibleBudgetError: {e}")
+        print(f"  diagnostics attribute: {e.diagnostics}")
 
 
 def main():
     demo_normal_planning()
     demo_greedy_counterexample()
+    demo_caps_and_deactivation()
     demo_rejections()
     print()
     print("demo finished: all numbers above were computed in this run.")
