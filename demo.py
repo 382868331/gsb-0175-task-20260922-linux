@@ -1,14 +1,20 @@
 """Deterministic offline demo for the wayplan library.
 
-Runs three real computations (no sleeps, no prerecorded output):
+Runs five real computations (no sleeps, no prerecorded output):
 
   1. a normal 3-app planning run: per-way miss curves, the exact optimal
      allocation, and replay statistics on the isolated caches;
   2. a hand-built counterexample where marginal-gain greedy is provably
      worse than the exact planner;
-  3. two genuinely triggered rejections (NaN weight, infeasible budget).
+  3. hard per-app miss caps + a disableable app: the constrained exact
+     plan (which no patch of the unconstrained optimum can reach) and an
+     independent replay verifying every hard constraint;
+  4. a zero-budget plan (every app disableable) and a genuinely triggered
+     infeasibility with its necessary-condition diagnostics;
+  5. two genuinely triggered rejections (NaN weight, invalid cap).
 
 Everything is computed from deterministic in-repo data (fixed seeds).
+Total runtime is a fraction of a second, far below the 90 s budget.
 """
 
 import math
@@ -19,6 +25,7 @@ from wayplan import (
     ValidationError,
     plan_allocation,
     replay_isolated,
+    verify_plan,
 )
 
 
@@ -130,23 +137,97 @@ def demo_greedy_counterexample():
           f"never reaches after spending ways on appA's early gain.")
 
 
+def demo_caps_and_disable():
+    section("3. Hard miss caps + disableable app (exact constrained plan)")
+    # num_sets=1, hand-known curves:
+    #   crit: [0,1] alternating          -> (40, 2, 2, 2, 2)
+    #   bulk: 3-block cycle, 200 accesses-> (200, 200, 3, 3, 3)
+    #   mix:  25x(20,21) + 17x(20,21,22) -> (101, 51, 3, 3, 3)
+    crit = [0, 1] * 20
+    bulk = ([10, 11, 12] * 67)[:200]
+    mix = ([20, 21] * 25) + ([20, 21, 22] * 17)
+    traces = [("crit", crit), ("bulk", bulk), ("mix", mix)]
+    weights = [1, 1, 1]
+
+    unc = plan_allocation(traces, weights, num_sets=1, total_ways=5, budget=5)
+    print(f"unconstrained optimum: {unc.allocation_map()} "
+          f"-> objective {unc.objective}")
+
+    # crit gets a hard miss cap of 2; bulk may be disabled for penalty 150.
+    result = plan_allocation(
+        traces, weights, num_sets=1, total_ways=5, budget=5,
+        miss_caps=[2, None, None],
+        disable_penalties=[None, 150, None],
+    )
+    print_curves(result)
+    print()
+    print(f"constrained plan: {result.allocation_map()}")
+    print(f"  objective {result.objective} = weighted misses "
+          f"{result.weighted_misses} + disable penalties "
+          f"{result.disable_penalty_total}")
+    print(f"  disabled apps (reported separately): "
+          f"{result.disabled_app_ids or 'none'}")
+    print(f"  per-app misses: "
+          f"{dict(zip(result.app_ids, result.per_app_misses))} "
+          f"(cap on crit: 2)")
+    print("  note: patching the unconstrained (bulk=3,crit=1,mix=1) to respect\n"
+          "        the cap can only reach (bulk=2,crit=2,mix=1) at cost 303 —\n"
+          "        the exact constrained DP instead disables bulk outright\n"
+          "        (penalty 150) and reinvests the ways, reaching 155.  This\n"
+          "        is why no compute-then-patch step is used.")
+
+    report = verify_plan(traces, result)
+    print()
+    print("independent replay verification of every hard constraint:")
+    for c in report.checks:
+        print(f"  [{'ok' if c.ok else 'FAIL'}] {c.name}: {c.detail}")
+    print(f"  => plan verified: {report.ok}")
+
+
+def demo_zero_budget_and_infeasible():
+    section("4. Zero budget and proved-infeasible diagnostics")
+    traces = [("a", [0, 1]), ("b", [2, 3])]
+    r = plan_allocation(traces, [1, 1], num_sets=2, total_ways=4, budget=0,
+                        disable_penalties=[3, 7])
+    print(f"zero budget, all apps disableable: {r.allocation_map()}, "
+          f"objective {r.objective} (penalties only)")
+
+    # bulk's best achievable is 3 misses; a cap of 2 is unreachable and the
+    # app may not be disabled -> proved infeasible, with diagnostics.
+    try:
+        plan_allocation([("crit", [0, 1] * 20),
+                         ("bulk", ([10, 11, 12] * 67)[:200])],
+                        [1, 1], num_sets=1, total_ways=4, budget=4,
+                        miss_caps=[None, 2])
+    except InfeasibleBudgetError as e:
+        print()
+        print("infeasible cap configuration -> InfeasibleBudgetError:")
+        print(f"  {e}")
+        print(f"  diagnostic attributes: app_ids={e.app_ids}, "
+              f"min_ways={e.min_ways}, required_total={e.required_total}, "
+              f"budget={e.budget}")
+
+
 def demo_rejections():
-    section("3. Genuinely triggered rejections")
+    section("5. Genuinely triggered rejections")
     try:
         plan_allocation([("a", [0, 1]), ("b", [2])], [1, math.nan],
                         num_sets=2, total_ways=4, budget=3)
     except ValidationError as e:
         print(f"NaN weight rejected   -> ValidationError: {e}")
     try:
-        plan_allocation([("a", [0]), ("b", [1]), ("c", [2])], [1, 1, 1],
-                        num_sets=2, total_ways=4, budget=2)
-    except InfeasibleBudgetError as e:
-        print(f"infeasible budget     -> InfeasibleBudgetError: {e}")
+        plan_allocation([("a", [0, 1]), ("b", [2])], [1, 1],
+                        num_sets=2, total_ways=4, budget=3,
+                        miss_caps=[-1, None])
+    except ValidationError as e:
+        print(f"negative cap rejected -> ValidationError: {e}")
 
 
 def main():
     demo_normal_planning()
     demo_greedy_counterexample()
+    demo_caps_and_disable()
+    demo_zero_budget_and_infeasible()
     demo_rejections()
     print()
     print("demo finished: all numbers above were computed in this run.")

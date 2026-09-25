@@ -83,6 +83,11 @@ class RangeContract(unittest.TestCase):
         with self.assertRaises(ValidationError):
             plan(total_ways=MAX_WAYS + 1)
         with self.assertRaises(ValidationError):
+            plan(budget=-1)
+        # budget 0 is valid input since v1.1 (feasible only when every app
+        # is disableable); with the default all-mandatory apps it is
+        # proved infeasible, which is NOT a validation error
+        with self.assertRaises(InfeasibleBudgetError):
             plan(budget=0)
         # budget may not exceed total_ways (cannot hand out ways that
         # do not exist in the cache being partitioned)
@@ -137,7 +142,7 @@ class ErrorSemantics(unittest.TestCase):
             (dict(weights=[1, -1]), "weights[1]"),
             (dict(num_sets=99), "num_sets"),
             (dict(total_ways=0), "total_ways"),
-            (dict(budget=0), "budget"),
+            (dict(budget=-1), "budget"),
             (dict(traces=[("a", [0, -5]), ("b", [1])]), "blocks"),
         ]
         for kwargs, needle in cases:
