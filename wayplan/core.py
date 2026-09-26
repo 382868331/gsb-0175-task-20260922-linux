@@ -24,6 +24,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
+from fractions import Fraction
 
 from .errors import InfeasibleBudgetError, ValidationError
 
@@ -150,6 +151,24 @@ def _normalize_weights(weights, app_ids):
     out = []
     for i, w in enumerate(ws):
         out.append(_require_int(w, f"weights[{i}]", 1))
+    return tuple(out)
+
+
+def _normalize_references(references, app_ids):
+    if isinstance(references, (str, bytes)) or not hasattr(references, "__iter__"):
+        raise ValidationError(
+            f"references: expected an iterable of positive ints, "
+            f"got {type(references).__name__}"
+        )
+    refs = list(references)
+    if len(refs) != len(app_ids):
+        raise ValidationError(
+            f"references: expected {len(app_ids)} reference miss counts "
+            f"(one per application, aligned with traces order), got {len(refs)}"
+        )
+    out = []
+    for i, r in enumerate(refs):
+        out.append(_require_int(r, f"references[{i}]", 1))
     return tuple(out)
 
 
@@ -310,6 +329,158 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
         allocation=alloc,
         per_app_misses=per_app,
         weighted_misses=total_cost,
+        used_ways=sum(alloc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fair allocation planner (lexicographic max-ratio / weighted-sum / vector)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FairPlanResult:
+    """Result of plan_fair_allocation.  All fields are immutable."""
+
+    num_sets: int
+    total_ways: int
+    budget: int
+    app_ids: tuple[str, ...]              # sorted by app id
+    weights: tuple[int, ...]              # aligned with app_ids
+    references: tuple[int, ...]           # reference miss counts, aligned with app_ids
+    curves: tuple[tuple[int, ...], ...]   # curves[i][w-1] = misses of app i with w ways
+    allocation: tuple[int, ...]           # ways per app, aligned with app_ids
+    per_app_misses: tuple[int, ...]       # misses at the allocated way count
+    max_ratio_num: int                    # exact numerator of max misses/reference
+    max_ratio_den: int                    # exact denominator (reduced fraction)
+    max_ratio_apps: tuple[str, ...]       # app ids attaining the max ratio
+    weighted_misses: int                  # secondary objective value
+    used_ways: int                        # sum(allocation), always <= budget
+
+    def allocation_map(self):
+        """Allocation as an insertion-ordered dict keyed by app id."""
+        return dict(zip(self.app_ids, self.allocation))
+
+    @property
+    def max_ratio(self):
+        """The minimised max misses/reference as an exact Fraction."""
+        return Fraction(self.max_ratio_num, self.max_ratio_den)
+
+
+def plan_fair_allocation(traces, weights, references, num_sets, total_ways,
+                         budget):
+    """Choose integer way counts minimising relative loss, lexicographically.
+
+    Objectives, in strict lexicographic order:
+
+    1. minimise max_i (misses_i / references_i), compared with exact
+       rational arithmetic (fractions.Fraction); two distinct allocations
+       are never treated as tied by a floating-point epsilon;
+    2. minimise the weighted miss sum sum_i weights_i * misses_i;
+    3. take the lexicographically smallest allocation vector (apps ordered
+       by app id).
+
+    Parameters
+    ----------
+    traces     : iterable of AppTrace (or (app_id, blocks) pairs), 1..6 apps,
+                 unique app ids.
+    weights    : iterable of positive ints aligned with traces order
+                 (used only for the secondary objective).
+    references : iterable of positive ints aligned with traces order;
+                 the reference miss count each application's misses are
+                 normalised against.
+    num_sets, total_ways, budget : same contract as plan_allocation.
+
+    Every application still receives at least one way (the fair mode does
+    not disable applications); budget < n_apps is proved infeasible and
+    raises InfeasibleBudgetError, exactly as in the cost-minimising entry
+    point.  Miss curves are not assumed convex.
+
+    Returns a FairPlanResult.
+    """
+    apps_in = _normalize_traces(traces)
+    ws_in = _normalize_weights(weights, [t.app_id for t in apps_in])
+    refs_in = _normalize_references(references, [t.app_id for t in apps_in])
+    num_sets = _require_num_sets(num_sets)
+    total_ways = _require_int(total_ways, "total_ways", 1, MAX_WAYS)
+    budget = _require_int(budget, "budget", 1, total_ways)
+
+    paired = sorted(zip(apps_in, ws_in, refs_in), key=lambda p: p[0].app_id)
+    apps = tuple(p[0] for p in paired)
+    ws = tuple(p[1] for p in paired)
+    refs = tuple(p[2] for p in paired)
+    n = len(apps)
+    if budget < n:
+        raise InfeasibleBudgetError(
+            f"budget: {budget} way(s) cannot give each of the {n} "
+            f"application(s) its mandatory minimum of 1 way"
+        )
+
+    curves = tuple(miss_curve(t.blocks, num_sets, total_ways) for t in apps)
+    # ratio[i][a] = exact relative loss of app i with a ways;
+    # wcost[i][a] = weighted misses of app i with a ways (a in 1..total_ways).
+    ratio = [
+        [Fraction(0) if a == 0 else Fraction(curves[i][a - 1], refs[i])
+         for a in range(total_ways + 1)]
+        for i in range(n)
+    ]
+    wcost = [
+        [ws[i] * curves[i][a - 1] for a in range(total_ways + 1)]
+        for i in range(n)
+    ]
+
+    # best[i][b] = (max_ratio, weighted_sum, allocation_tuple) for apps
+    # i..n-1 with at most b ways, or None when infeasible.  Tuple
+    # comparison implements the three-level lexicographic objective
+    # exactly (Fractions compare without any tolerance).
+    best = [[None] * (budget + 1) for _ in range(n + 1)]
+    for b in range(budget + 1):
+        best[n][b] = (Fraction(0), 0, ())
+    for i in range(n - 1, -1, -1):
+        remaining_after = n - 1 - i
+        for b in range(budget + 1):
+            top = min(total_ways, b - remaining_after)
+            if top < 1:
+                continue
+            chosen = None
+            for a in range(1, top + 1):
+                tail = best[i + 1][b - a]
+                if tail is None:
+                    continue
+                cand = (
+                    max(ratio[i][a], tail[0]),
+                    wcost[i][a] + tail[1],
+                    (a,) + tail[2],
+                )
+                if chosen is None or cand < chosen:
+                    chosen = cand
+            best[i][b] = chosen
+
+    final = best[0][budget]
+    if final is None:  # unreachable given the checks above; defensive
+        raise InfeasibleBudgetError(
+            f"budget: {budget} way(s) infeasible for {n} application(s)"
+        )
+    max_ratio, weighted_sum, alloc = final
+    per_app = tuple(curves[i][alloc[i] - 1] for i in range(n))
+    attaining = tuple(
+        apps[i].app_id
+        for i in range(n)
+        if Fraction(per_app[i], refs[i]) == max_ratio
+    )
+    return FairPlanResult(
+        num_sets=num_sets,
+        total_ways=total_ways,
+        budget=budget,
+        app_ids=tuple(t.app_id for t in apps),
+        weights=ws,
+        references=refs,
+        curves=curves,
+        allocation=alloc,
+        per_app_misses=per_app,
+        max_ratio_num=max_ratio.numerator,
+        max_ratio_den=max_ratio.denominator,
+        max_ratio_apps=attaining,
+        weighted_misses=weighted_sum,
         used_ways=sum(alloc),
     )
 

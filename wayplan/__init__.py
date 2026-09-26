@@ -6,6 +6,9 @@ Public interface (fixed contract, see README.md):
 - :func:`simulate_lru_misses`— exact LRU miss count for one configuration
 - :func:`miss_curve`         — miss counts for every way count 1..max_ways
 - :func:`plan_allocation`    — exact DP way allocation -> :class:`PlanResult`
+- :func:`plan_fair_allocation`
+                           — lexicographic fair allocation (max ratio, then
+                             weighted sum, then vector) -> FairPlanResult
 - :func:`replay_isolated`    — replay stats on isolated caches -> ReplayStats
 - :class:`WayPlanError`, :class:`ValidationError`,
   :class:`InfeasibleBudgetError` — error taxonomy
@@ -17,9 +20,11 @@ from .core import (
     MAX_SETS,
     MAX_WAYS,
     AppTrace,
+    FairPlanResult,
     PlanResult,
     ReplayStats,
     miss_curve,
+    plan_fair_allocation,
     plan_allocation,
     replay_isolated,
     simulate_lru_misses,
@@ -31,9 +36,11 @@ __all__ = [
     "MAX_SETS",
     "MAX_WAYS",
     "AppTrace",
+    "FairPlanResult",
     "PlanResult",
     "ReplayStats",
     "miss_curve",
+    "plan_fair_allocation",
     "plan_allocation",
     "replay_isolated",
     "simulate_lru_misses",
