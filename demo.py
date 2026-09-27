@@ -6,7 +6,9 @@ Runs three real computations (no sleeps, no prerecorded output):
      allocation, and replay statistics on the isolated caches;
   2. a hand-built counterexample where marginal-gain greedy is provably
      worse than the exact planner;
-  3. two genuinely triggered rejections (NaN weight, infeasible budget).
+  3. a warm-start planning run from an explicit initial cache state,
+     compared with the cold-start run and showing LRU-first shrinking;
+  4. two genuinely triggered rejections (NaN weight, infeasible budget).
 
 Everything is computed from deterministic in-repo data (fixed seeds).
 """
@@ -19,6 +21,7 @@ from wayplan import (
     ValidationError,
     plan_allocation,
     replay_isolated,
+    simulate_lru_misses,
 )
 
 
@@ -130,8 +133,45 @@ def demo_greedy_counterexample():
           f"never reaches after spending ways on appA's early gain.")
 
 
+def demo_warm_start():
+    section("3. Warm-start planning (explicit initial cache contents)")
+    # Single set.  The cache is known to already hold block 1 (MRU).
+    initial_state = [[1]]
+    # appA reuses block 1 immediately; appB only touches block 5.
+    traces = [("appA", [1, 0, 1, 0]), ("appB", [5, 5, 5])]
+    weights = [1, 1]
+
+    cold = plan_allocation(traces, weights, num_sets=1,
+                           total_ways=3, budget=3)
+    warm = plan_allocation(traces, weights, num_sets=1,
+                           total_ways=3, budget=3,
+                           initial_state=initial_state)
+    print(f"initial state (LRU -> MRU per set): {initial_state}")
+    print("miss curves per candidate way count:")
+    print("app        cold 1w/2w/3w   warm 1w/2w/3w")
+    for i, app_id in enumerate(warm.app_ids):
+        print(f"{app_id:<10}{cold.curves[i]!s:>14}   {warm.curves[i]!s}")
+    print()
+    print(f"cold optimal allocation {cold.allocation_map()} "
+          f"-> weighted misses {cold.weighted_misses}")
+    print(f"warm optimal allocation {warm.allocation_map()} "
+          f"-> weighted misses {warm.weighted_misses}")
+    print("every candidate above was simulated from the same normalised "
+          "initial state;")
+    print("none inherited cache contents from another candidate.")
+    # Shrinking capacity: 3 initial blocks, 2-way candidate keeps the 2 MRU.
+    oversize = [[0, 1, 2]]  # 0 is LRU, 2 is MRU
+    m2 = simulate_lru_misses([1, 2, 0], 1, 2, initial_state=oversize)
+    m1 = simulate_lru_misses([1, 2, 0], 1, 1, initial_state=oversize)
+    print(f"oversized initial row {oversize}: 2-way run keeps {{1,2}} -> "
+          f"{m2} miss(es); 1-way run keeps {{2}} -> {m1} miss(es).")
+    stats = replay_isolated(traces, warm.allocation_map(), num_sets=1,
+                            initial_state=initial_state)
+    print_replay(stats)
+
+
 def demo_rejections():
-    section("3. Genuinely triggered rejections")
+    section("4. Genuinely triggered rejections")
     try:
         plan_allocation([("a", [0, 1]), ("b", [2])], [1, math.nan],
                         num_sets=2, total_ways=4, budget=3)
@@ -147,6 +187,7 @@ def demo_rejections():
 def main():
     demo_normal_planning()
     demo_greedy_counterexample()
+    demo_warm_start()
     demo_rejections()
     print()
     print("demo finished: all numbers above were computed in this run.")

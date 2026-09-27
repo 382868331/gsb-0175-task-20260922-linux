@@ -10,6 +10,12 @@ Public interface (fixed contract, see README.md):
 - :class:`WayPlanError`, :class:`ValidationError`,
   :class:`InfeasibleBudgetError` — error taxonomy
 - ``MAX_APPS`` / ``MAX_SETS`` / ``MAX_WAYS`` — interface bounds (6/16/12)
+
+The three simulation entry points and the planner accept an optional
+``initial_state`` (one row per set, blocks ordered LRU -> MRU).  Every
+candidate run starts from the same normalised, immutable copy of it; rows
+longer than the candidate way count are shrunk LRU-first, so candidates
+never share or inherit cache contents.
 """
 
 from .core import (

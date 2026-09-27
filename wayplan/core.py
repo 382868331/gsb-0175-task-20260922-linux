@@ -16,7 +16,14 @@ Pipeline (all exact, no convexity assumption, no greedy heuristic):
 Address model: the input is a sequence of *block addresses* (non-negative
 ints, block granularity — the block offset is already removed).  A block
 ``b`` maps to set ``b % num_sets`` and uses the full block id as its tag.
-Each simulated cache is cold (empty) at the start of a run.
+Each simulated cache starts cold (empty) unless an explicit ``initial_state``
+is supplied.  An initial state gives, per set, the blocks already present
+ordered from least to most recently used.  Every candidate way count (and
+every candidate allocation) is simulated from the *same* normalised,
+immutable copy of that initial state — no run can observe cache contents
+left behind by a previous run.  When a set's initial contents exceed the
+simulated way count, the excess is evicted LRU-first before the trace is
+processed (the documented replacement rule applied to shrinking capacity).
 """
 
 from __future__ import annotations
@@ -82,7 +89,60 @@ def _require_blocks(blocks, name="blocks"):
     for i, b in enumerate(blocks):
         out.append(_require_int(b, f"{name}[{i}]", 0))
     if not out:
-        raise ValidationError(f"{name}: trace must contain at least one access")
+       raise ValidationError(f"{name}: trace must contain at least one access")
+    return tuple(out)
+
+
+def _normalize_initial_state(initial_state, num_sets):
+    """Validate an optional warm-start cache state.
+
+    ``initial_state`` must be an iterable of exactly ``num_sets`` rows;
+    row ``s`` lists the blocks already present in set ``s``, ordered from
+    least recently used to most recently used.  Returns an immutable
+    tuple-of-tuples copy, or ``None`` for a cold start.  The caller's
+    object is never mutated and never aliased, so every simulation run
+    starts from the same explicit initial condition.
+    """
+    if initial_state is None:
+        return None
+    if isinstance(initial_state, (str, bytes)) or not hasattr(
+        initial_state, "__iter__"
+    ):
+        raise ValidationError(
+            f"initial_state: expected an iterable of {num_sets} per-set "
+            f"rows, got {type(initial_state).__name__}"
+        )
+    rows = list(initial_state)
+    if len(rows) != num_sets:
+        raise ValidationError(
+            f"initial_state: expected exactly num_sets={num_sets} rows, "
+            f"got {len(rows)}"
+        )
+    out = []
+    for s, row in enumerate(rows):
+        if isinstance(row, (str, bytes)) or not hasattr(row, "__iter__"):
+            raise ValidationError(
+                f"initial_state[{s}]: expected an iterable of block "
+                f"addresses (LRU first), got {type(row).__name__}"
+            )
+        entries = []
+        seen = set()
+        for i, b in enumerate(row):
+            b = _require_int(b, f"initial_state[{s}][{i}]", 0)
+            if b % num_sets != s:
+                raise ValidationError(
+                    f"initial_state[{s}][{i}]: block {b} maps to set "
+                    f"{b % num_sets}, not set {s}; initial contents must "
+                    f"be placed in the set they belong to"
+                )
+            if b in seen:
+                raise ValidationError(
+                    f"initial_state[{s}][{i}]: duplicate block {b} in "
+                    f"set {s}; a block can occupy a set only once"
+                )
+            seen.add(b)
+            entries.append(b)
+        out.append(tuple(entries))
     return tuple(out)
 
 
@@ -157,18 +217,23 @@ def _normalize_weights(weights, app_ids):
 # LRU simulation
 # ---------------------------------------------------------------------------
 
-def simulate_lru_misses(blocks, num_sets, num_ways):
-    """Exact miss count of a cold set-associative LRU cache.
+def _simulate(blocks, num_sets, num_ways, initial):
+    """Core LRU run on a fresh cache state (no validation here).
 
-    ``blocks``  — iterable of non-negative int block addresses.
-    ``num_sets``— 1..MAX_SETS; block b maps to set ``b % num_sets``.
-    ``num_ways``— 1..MAX_WAYS; associativity of every set.
+    ``initial`` is None (cold start) or a normalised tuple-of-tuples.
+    A set whose initial contents exceed ``num_ways`` is first shrunk by
+    evicting LRU entries until exactly ``num_ways`` (the most recently
+    used) remain — the same replacement rule the trace itself follows.
     """
-    num_sets = _require_num_sets(num_sets)
-    num_ways = _require_int(num_ways, "num_ways", 1, MAX_WAYS)
-    blocks = _require_blocks(blocks)
-
-    sets = [OrderedDict() for _ in range(num_sets)]  # key=block, LRU->MRU order
+    sets = []  # key=block, LRU->MRU order
+    for s in range(num_sets):
+        cache = OrderedDict()
+        if initial is not None:
+            # Keep the num_ways most-recently-used entries; a negative
+            # slice of a shorter row simply returns the whole row.
+            for b in initial[s][-num_ways:]:
+                cache[b] = None
+        sets.append(cache)
     misses = 0
     for b in blocks:
         cache = sets[b % num_sets]
@@ -182,17 +247,43 @@ def simulate_lru_misses(blocks, num_sets, num_ways):
     return misses
 
 
-def miss_curve(blocks, num_sets, max_ways):
+def simulate_lru_misses(blocks, num_sets, num_ways, initial_state=None):
+    """Exact miss count of a set-associative LRU cache.
+
+    ``blocks``       — iterable of non-negative int block addresses.
+    ``num_sets``     — 1..MAX_SETS; block b maps to set ``b % num_sets``.
+    ``num_ways``     — 1..MAX_WAYS; associativity of every set.
+    ``initial_state``— optional warm start: one row per set, each row the
+                       blocks already present ordered LRU -> MRU.  Rows
+                       longer than ``num_ways`` are shrunk LRU-first.
+                       The run works on a private copy; the caller's
+                       object is never mutated.
+    """
+    num_sets = _require_num_sets(num_sets)
+    num_ways = _require_int(num_ways, "num_ways", 1, MAX_WAYS)
+    blocks = _require_blocks(blocks)
+    initial = _normalize_initial_state(initial_state, num_sets)
+    return _simulate(blocks, num_sets, num_ways, initial)
+
+
+def miss_curve(blocks, num_sets, max_ways, initial_state=None):
     """Miss counts for every way count 1..max_ways.
 
     Returns a tuple of length ``max_ways``; element ``[w - 1]`` is the miss
     count with ``w`` ways.  No monotonicity or convexity is assumed.
+
+    With ``initial_state`` given, *every* way count is simulated from the
+    same normalised copy of that initial state (shrunk LRU-first when a
+    set holds more blocks than the candidate way count); candidate runs
+    never inherit cache contents from one another.
     """
     max_ways = _require_int(max_ways, "max_ways", 1, MAX_WAYS)
     blocks = _require_blocks(blocks)
     num_sets = _require_num_sets(num_sets)
+    initial = _normalize_initial_state(initial_state, num_sets)
     return tuple(
-        simulate_lru_misses(blocks, num_sets, w) for w in range(1, max_ways + 1)
+        _simulate(blocks, num_sets, w, initial)
+        for w in range(1, max_ways + 1)
     )
 
 
@@ -214,13 +305,15 @@ class PlanResult:
     per_app_misses: tuple[int, ...]       # misses at the allocated way count
     weighted_misses: int                  # minimised objective value
     used_ways: int                        # sum(allocation), always <= budget
+    initial_state: tuple[tuple[int, ...], ...] | None  # normalised warm start
 
     def allocation_map(self):
         """Allocation as an insertion-ordered dict keyed by app id."""
         return dict(zip(self.app_ids, self.allocation))
 
 
-def plan_allocation(traces, weights, num_sets, total_ways, budget):
+def plan_allocation(traces, weights, num_sets, total_ways, budget,
+                    initial_state=None):
     """Choose integer way counts minimising the weighted miss sum.
 
     Parameters
@@ -233,6 +326,12 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
     total_ways : 1..12, associativity of the cache; miss curves are
                  computed for 1..total_ways ways per app.
     budget     : 1..total_ways, maximum total ways handed out.
+    initial_state : optional warm start shared by all applications and all
+                 candidate way counts: one row per set, blocks ordered
+                 LRU -> MRU.  Every candidate allocation is evaluated from
+                 this same initial condition; the per-app isolation
+                 constraints (>= 1 way each, total <= budget) are
+                 unchanged.
 
     Returns a :class:`PlanResult`.  Among all allocations with the minimal
     weighted miss sum, the lexicographically smallest allocation vector
@@ -250,6 +349,7 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
     num_sets = _require_num_sets(num_sets)
     total_ways = _require_int(total_ways, "total_ways", 1, MAX_WAYS)
     budget = _require_int(budget, "budget", 1, total_ways)
+    initial = _normalize_initial_state(initial_state, num_sets)
 
     # Pair each trace with its weight *before* sorting, so weights stay
     # aligned with the application they were supplied for.
@@ -263,7 +363,10 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
             f"application(s) its mandatory minimum of 1 way"
         )
 
-    curves = tuple(miss_curve(t.blocks, num_sets, total_ways) for t in apps)
+    curves = tuple(
+        miss_curve(t.blocks, num_sets, total_ways, initial_state=initial)
+        for t in apps
+    )
     # cost[i][a] = weighted misses of app i when given a ways (a in 1..total_ways)
     cost = [
         [ws[i] * curves[i][a - 1] for a in range(total_ways + 1)]
@@ -311,6 +414,7 @@ def plan_allocation(traces, weights, num_sets, total_ways, budget):
         per_app_misses=per_app,
         weighted_misses=total_cost,
         used_ways=sum(alloc),
+        initial_state=initial,
     )
 
 
@@ -330,17 +434,19 @@ class ReplayStats:
     hit_rate: float  # hits / accesses, exact IEEE-754 double in [0.0, 1.0]
 
 
-def replay_isolated(traces, allocation, num_sets):
+def replay_isolated(traces, allocation, num_sets, initial_state=None):
     """Replay every app on a private LRU cache of its allocated ways.
 
     ``allocation`` maps app_id -> ways (int >= 1) and must cover exactly the
     app ids in ``traces``.  Returns a tuple of :class:`ReplayStats` ordered
-    by app id.  The replay is independent of the planning run (cold caches),
+    by app id.  The replay starts from the same initial condition as the
+    planning run (cold caches, or the shared ``initial_state`` when given),
     so its miss counts must match the planned curves — a consistency check
     the test-suite performs rather than assumes.
     """
     apps = _normalize_traces(traces)
     num_sets = _require_num_sets(num_sets)
+    initial = _normalize_initial_state(initial_state, num_sets)
     if not hasattr(allocation, "items"):
         raise ValidationError(
             f"allocation: expected a mapping app_id -> ways, "
@@ -360,7 +466,7 @@ def replay_isolated(traces, allocation, num_sets):
     out = []
     for t in sorted(apps, key=lambda t: t.app_id):
         ways = alloc[t.app_id]
-        misses = simulate_lru_misses(t.blocks, num_sets, ways)
+        misses = _simulate(t.blocks, num_sets, ways, initial)
         accesses = len(t.blocks)
         hits = accesses - misses
         out.append(

@@ -31,10 +31,10 @@ stats = replay_isolated(traces, result.allocation_map(), num_sets=1)
 | 名称 | 说明 |
 |---|---|
 | `AppTrace(app_id, blocks)` | 已验证的不可变轨迹；也接受 `(app_id, blocks)` 元组作为输入 |
-| `simulate_lru_misses(blocks, num_sets, num_ways) -> int` | 单配置冷启动 LRU miss 数 |
-| `miss_curve(blocks, num_sets, max_ways) -> tuple[int, ...]` | 下标 `w-1` 为 `w` 路的 miss 数 |
-| `plan_allocation(traces, weights, num_sets, total_ways, budget) -> PlanResult` | 精确 DP 最优分配 |
-| `replay_isolated(traces, allocation, num_sets) -> tuple[ReplayStats, ...]` | 隔离缓存重放统计 |
+| `simulate_lru_misses(blocks, num_sets, num_ways, initial_state=None) -> int` | LRU miss 数；默认冷启动，可给初始缓存 |
+| `miss_curve(blocks, num_sets, max_ways, initial_state=None) -> tuple[int, ...]` | 下标 `w-1` 为 `w` 路的 miss 数 |
+| `plan_allocation(..., initial_state=None) -> PlanResult` | 精确 DP 最优分配（可选暖启动） |
+| `replay_isolated(traces, allocation, num_sets, initial_state=None) -> tuple[ReplayStats, ...]` | 隔离缓存重放统计 |
 | `WayPlanError` / `ValidationError` / `InfeasibleBudgetError` | 错误分类 |
 | `MAX_APPS` / `MAX_SETS` / `MAX_WAYS` | 接口上限常量 6 / 16 / 12 |
 
@@ -42,11 +42,22 @@ stats = replay_isolated(traces, result.allocation_map(), num_sets=1)
 weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 另有 `allocation_map()` 返回 `{app_id: ways}`。
 
+`simulate_lru_misses` / `miss_curve` / `plan_allocation` / `replay_isolated`
+均接受可选关键字参数 `initial_state`（默认 `None`，即冷启动）。
+`initial_state` 是长度恰为 `num_sets` 的可迭代对象，第 `s` 行按
+**LRU → MRU（最久未用在前、最近使用在后）** 给出组 `s` 启动时已有的块；
+行可以为空。`PlanResult.initial_state` 保存规范化后的不可变副本（冷启动为
+`None`）。
+
 ### 地址模型
 
 输入为**块地址**序列（块内偏移已剔除）。块 `b` 映射到组 `b % num_sets`，
 以完整块号为 tag。每次模拟/重放均为冷启动（空缓存）。只实现 LRU 替换策略，
-不宣称兼容任何硬件或行业标准协议。
+不宣称兼容任何硬件或行业标准协议。默认每次模拟/重放为冷启动；给出
+`initial_state` 时从该暖状态开始：所有候选路数与候选分配都从**同一份**
+规范化初始状态的独立副本出发，前一个方案运行后的缓存绝不会留给后一个方案；
+当初始行块数超过候选路数时，在轨迹开始前按 LRU 规则挤出最久未用的块
+（保留最近使用的 `w` 个）。
 
 ### 输入上限与约束
 
@@ -56,6 +67,9 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 - 块地址为非负 int，轨迹非空；
 - 权重为正整数，按 `traces` 的**输入顺序**对齐（库内部再按 app id 排序，
   权重随应用走，不会错位）。
+- `initial_state`：每行中的块必须满足 `b % num_sets == 组号`，同一组内
+  块不重复，非负 int（同样拒绝 `bool`）；行数不等于 `num_sets`、块放错组、
+  组内重复均为 `ValidationError`，消息定位到 `initial_state[组][下标]`。
 
 ## 错误语义
 
@@ -83,21 +97,23 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   字典序最小（元组比较天然完成）。不假定 miss 曲线凸或单调，不用边际收益
   贪心替代最优——`demo.py` 第 2 节给出贪心劣于最优 159 次 miss 的实际反例。
 - **逐路独立模拟**：对每个路数 1..total_ways 分别重放轨迹（每次 O(访问数)），
-  实现直白、易于手工核对；本题上限下总开销微不足道（demo 全程 < 0.1 秒）。
-  未采用单次扫描算全部路数的栈式算法，以换取可验证性。
+  实现直白、易于手工核对；暖启动时每次从同一份规范化初始状态构造全新缓存，
+  候选之间天然隔离，且行块数超出路数时直接按 LRU 保留最近 `w` 块；本题
+  上限下总开销微不足道（demo 全程 < 0.1 秒）。未采用单次扫描算全部路数的
+  栈式算法，以换取可验证性。
 - **先验证后计算**：所有参数在进入算法前集中校验，失败即抛，无部分结果。
 
 ## 已知限制
 
-- 仅 LRU 替换策略、冷启动、块地址粒度；不建模写回、预取、共享/窃取路、
-  组间异构或运行时动态重划分。
+- 仅 LRU 替换策略、块地址粒度（默认冷启动，可选 `initial_state` 暖启动）；
+  不建模写回、预取、共享/窃取路、组间异构或运行时动态重划分。
 - 曲线按 `b % num_sets` 取组，不模拟物理地址哈希。
 - 上限（6 应用 / 16 组 / 12 路）是接口边界而非性能极限；超出即拒绝。
 - 不宣称完整行业标准兼容；仅实现本 README 所述契约。
 
 ## 测试与验证
 
-`tests/` 下 30 个用例：
+`tests/` 下 48 个用例：
 
 - `test_lru.py`：手工推算的 LRU 曲线（含循环冲突 thrash、组映射隔离、
   LRU≠FIFO 判别）与模拟器输入校验；
@@ -107,6 +123,10 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   与 DP 逐一比对分配向量与目标值；重放一致性为补充性往返核对；
 - `test_validation.py`：NaN/Infinity、bool、类型、边界、可定位错误消息、
   失败后无残留状态。
+- `test_initial_state.py`：手工推算的暖启动 miss（含初始行超容量按 LRU
+  先挤出、初始内容的先后顺序影响结果）；每个候选路数从同一份初始状态
+  独立起步、调用方对象不被修改、跨调用无泄漏；暖启动规划与冷启动手工对照、
+  重放一致性、隔离限制仍成立及 `initial_state` 输入校验。
 
 ## 目录结构
 
