@@ -2,7 +2,8 @@
 
 离线体系结构优化工具库：对最多 6 个应用的合成访存块序列，逐路模拟
 set-associative LRU miss 曲线，再用**精确动态规划**在路数预算内选择每应用的
-隔离路数，最小化带正整数权重的 miss 总和，并在隔离缓存上重放统计。
+隔离路数，最小化带正整数权重的 miss 总和，并在隔离缓存上重放统计。支持为
+每个应用显式给出各组缓存的初始块和 LRU→MRU 使用顺序。
 
 - **Python 版本**：3.14.7（仅使用标准库，语法兼容 3.10+）
 - **依赖**：无第三方依赖，无需网络、账号、数据库、Docker；安装 Python 即可运行
@@ -19,11 +20,14 @@ python demo.py                            # 确定性演示（约 0.1 秒，远�
 from wayplan import plan_allocation, replay_isolated
 
 traces = [("appA", [0, 1] * 4), ("appB", [7] * 5)]
-result = plan_allocation(traces, weights=[3, 1],
-                         num_sets=1, total_ways=3, budget=3)
+# num_sets=1：每组一个元组，组内按 LRU -> MRU 排列。
+initial = {"appA": [(0,)], "appB": [()]}
+result = plan_allocation(traces, weights=[3, 1], num_sets=1,
+                         total_ways=3, budget=3, initial_caches=initial)
 print(result.curves)           # 逐路 miss 曲线
 print(result.allocation_map()) # {'appA': 2, 'appB': 1}
-stats = replay_isolated(traces, result.allocation_map(), num_sets=1)
+stats = replay_isolated(traces, result.allocation_map(), num_sets=1,
+                        initial_caches=result.initial_caches_map())
 ```
 
 ## 接口（固定契约）
@@ -31,22 +35,30 @@ stats = replay_isolated(traces, result.allocation_map(), num_sets=1)
 | 名称 | 说明 |
 |---|---|
 | `AppTrace(app_id, blocks)` | 已验证的不可变轨迹；也接受 `(app_id, blocks)` 元组作为输入 |
-| `simulate_lru_misses(blocks, num_sets, num_ways) -> int` | 单配置冷启动 LRU miss 数 |
-| `miss_curve(blocks, num_sets, max_ways) -> tuple[int, ...]` | 下标 `w-1` 为 `w` 路的 miss 数 |
-| `plan_allocation(traces, weights, num_sets, total_ways, budget) -> PlanResult` | 精确 DP 最优分配 |
-| `replay_isolated(traces, allocation, num_sets) -> tuple[ReplayStats, ...]` | 隔离缓存重放统计 |
+| `simulate_lru_misses(blocks, num_sets, num_ways, initial_cache=None) -> int` | 单配置 LRU miss 数；可给定暖缓存 |
+| `miss_curve(blocks, num_sets, max_ways, initial_cache=None) -> tuple[int, ...]` | 下标 `w-1` 为 `w` 路的 miss 数 |
+| `plan_allocation(..., initial_caches=None) -> PlanResult` | 从同一份初始条件精确 DP 最优分配 |
+| `replay_isolated(traces, allocation, num_sets, initial_caches=None) -> tuple[ReplayStats, ...]` | 隔离缓存重放统计 |
 | `WayPlanError` / `ValidationError` / `InfeasibleBudgetError` | 错误分类 |
 | `MAX_APPS` / `MAX_SETS` / `MAX_WAYS` | 接口上限常量 6 / 16 / 12 |
 
 `PlanResult` 字段：`num_sets, total_ways, budget, app_ids（按 app id 排序）,
-weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
-另有 `allocation_map()` 返回 `{app_id: ways}`。
+weights, curves, allocation, per_app_misses, weighted_misses, used_ways,
+initial_caches`；另有 `allocation_map()` 与 `initial_caches_map()`。
 
 ### 地址模型
 
 输入为**块地址**序列（块内偏移已剔除）。块 `b` 映射到组 `b % num_sets`，
-以完整块号为 tag。每次模拟/重放均为冷启动（空缓存）。只实现 LRU 替换策略，
-不宣称兼容任何硬件或行业标准协议。
+以完整块号为 tag。默认冷启动（空缓存）；暖缓存使用
+`initial_caches={app_id: (set0, set1, ...)}`，每个组内的块序列固定解释为
+**LRU → MRU**。块必须属于对应组（`b % num_sets == 组号`），同组不能重复。
+未列出的应用从空缓存开始；未知应用 ID 会被拒绝。
+
+规划 miss 曲线时，1..`total_ways` 的每个候选都从同一份初始状态的独立副本
+开始，前一个候选的访问和 LRU 更新不会泄漏给后一个候选。若候选容量小于初始
+占用，先按 LRU 从最旧端挤出多余块，再重放后续访问；这些缩容挤出不计入后续
+访问 miss。最终每应用仍至少 1 路，总分配不超过预算，隔离限制不变。只实现
+LRU 替换策略，不宣称兼容任何硬件或行业标准协议。
 
 ### 输入上限与约束
 
@@ -54,6 +66,7 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 - `num_sets` 1..16，`total_ways` 1..12，`budget` 1..`total_ways`
   （分配总量不可能超过被划分缓存自身的路数）；
 - 块地址为非负 int，轨迹非空；
+- 每个初始组长度为 0..12 且不能超过 `total_ways`；
 - 权重为正整数，按 `traces` 的**输入顺序**对齐（库内部再按 app id 排序，
   权重随应用走，不会错位）。
 
@@ -82,14 +95,14 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   规模 ≤ 6×12，一次递推即得全局最优；并列时按 app id 排序的分配向量取
   字典序最小（元组比较天然完成）。不假定 miss 曲线凸或单调，不用边际收益
   贪心替代最优——`demo.py` 第 2 节给出贪心劣于最优 159 次 miss 的实际反例。
-- **逐路独立模拟**：对每个路数 1..total_ways 分别重放轨迹（每次 O(访问数)），
-  实现直白、易于手工核对；本题上限下总开销微不足道（demo 全程 < 0.1 秒）。
+- **逐路独立模拟**：每个路数 1..total_ways 都复制同一份暖初始状态后重放
+  轨迹（每次 O(访问数)），候选之间不共享可变缓存；实现直白、易于手工核对。
   未采用单次扫描算全部路数的栈式算法，以换取可验证性。
 - **先验证后计算**：所有参数在进入算法前集中校验，失败即抛，无部分结果。
 
 ## 已知限制
 
-- 仅 LRU 替换策略、冷启动、块地址粒度；不建模写回、预取、共享/窃取路、
+- 仅 LRU 替换策略、显式冷/暖启动、块地址粒度；不建模写回、预取、共享/窃取路、
   组间异构或运行时动态重划分。
 - 曲线按 `b % num_sets` 取组，不模拟物理地址哈希。
 - 上限（6 应用 / 16 组 / 12 路）是接口边界而非性能极限；超出即拒绝。
@@ -97,7 +110,7 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
 
 ## 测试与验证
 
-`tests/` 下 30 个用例：
+`tests/` 下用例覆盖：
 
 - `test_lru.py`：手工推算的 LRU 曲线（含循环冲突 thrash、组映射隔离、
   LRU≠FIFO 判别）与模拟器输入校验；
@@ -106,7 +119,9 @@ weights, curves, allocation, per_app_misses, weighted_misses, used_ways`，
   列表式 LRU + 全枚举暴力搜索，不调用被测核心）在 60 个确定性随机小实例上
   与 DP 逐一比对分配向量与目标值；重放一致性为补充性往返核对；
 - `test_validation.py`：NaN/Infinity、bool、类型、边界、可定位错误消息、
-  失败后无残留状态。
+  失败后无残留状态；
+- `test_warm_cache.py`：手工 LRU→MRU 顺序、缩容从 LRU 挤出、所有候选使用
+  独立初始副本、暖缓存规划的独立暴力枚举对照和输入不被修改。
 
 ## 目录结构
 

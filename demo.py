@@ -2,8 +2,8 @@
 
 Runs three real computations (no sleeps, no prerecorded output):
 
-  1. a normal 3-app planning run: per-way miss curves, the exact optimal
-     allocation, and replay statistics on the isolated caches;
+  1. a warm 3-app planning run: explicit initial contents, miss curves, the
+     exact optimal allocation, and replay statistics on isolated caches;
   2. a hand-built counterexample where marginal-gain greedy is provably
      worse than the exact planner;
   3. two genuinely triggered rejections (NaN weight, infeasible budget).
@@ -84,12 +84,21 @@ def demo_normal_planning():
     # gamma: sequential scan of 24 blocks, repeated (streaming pattern).
     gamma = [i % 24 for i in range(120)]
 
+    initial = {
+        # Four set groups, each ordered LRU -> MRU. Missing entries mean the
+        # corresponding group position starts empty.
+        "alpha": [(0,), (1, 5), (), (11,)],
+        "beta": [(), (5,), (2, 6), ()],
+        "gamma": [(), (), (), (3, 11)],
+    }
+
     # Traces are deliberately passed NOT sorted by app id, and weights are
     # aligned with this input order (alpha=2, beta=3, gamma=1).
     traces = [("gamma", gamma), ("alpha", alpha), ("beta", beta)]
     weights = [1, 2, 3]
 
-    result = plan_allocation(traces, weights, num_sets=4, total_ways=8, budget=5)
+    result = plan_allocation(traces, weights, num_sets=4, total_ways=8,
+                             budget=5, initial_caches=initial)
     print_curves(result)
     print()
     print(f"optimal allocation (by app id): {result.allocation_map()}")
@@ -99,7 +108,9 @@ def demo_normal_planning():
     print(f"per-app misses at allocation: "
           f"{dict(zip(result.app_ids, result.per_app_misses))}")
     print()
-    print_replay(replay_isolated(traces, result.allocation_map(), num_sets=4))
+    print("initial caches (groups LRU -> MRU):", result.initial_caches_map())
+    print_replay(replay_isolated(traces, result.allocation_map(), num_sets=4,
+                                 initial_caches=result.initial_caches_map()))
 
 
 def demo_greedy_counterexample():

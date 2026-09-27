@@ -3,10 +3,10 @@
 Public interface (fixed contract, see README.md):
 
 - :class:`AppTrace`          — validated (app_id, blocks) trace
-- :func:`simulate_lru_misses`— exact LRU miss count for one configuration
-- :func:`miss_curve`         — miss counts for every way count 1..max_ways
-- :func:`plan_allocation`    — exact DP way allocation -> :class:`PlanResult`
-- :func:`replay_isolated`    — replay stats on isolated caches -> ReplayStats
+- :func:`simulate_lru_misses`— exact cold or warm LRU miss count
+- :func:`miss_curve`         — miss counts at every way count 1..max_ways
+- :func:`plan_allocation`    — exact DP from one shared initial condition
+- :func:`replay_isolated`    — warm/cold replay stats on isolated caches
 - :class:`WayPlanError`, :class:`ValidationError`,
   :class:`InfeasibleBudgetError` — error taxonomy
 - ``MAX_APPS`` / ``MAX_SETS`` / ``MAX_WAYS`` — interface bounds (6/16/12)
